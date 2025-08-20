@@ -1,208 +1,110 @@
 import os
-import re
 import time
 import requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-# ==========================
-# CONFIG
-# ==========================
-URLS = [
-    "https://www.allaccess.com.ar/event/airbag",
-    "https://www.allaccess.com.ar/event/bad-bunny",
-    # agregá más eventos manualmente aquí
-]
-
-CHECK_EVERY_SECONDS = int(os.getenv("CHECK_EVERY_SECONDS", "300"))  # 5 min por defecto
+# ==============================
+# Configuración
+# ==============================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+URLS = [u.strip() for u in os.getenv("MONITORED_URLS", "").split(",") if u.strip()]
+CHECK_EVERY = int(os.getenv("CHECK_EVERY_SECONDS", "300"))
 TZ_NAME = "America/Argentina/Buenos_Aires"
 
-# Horario de silencio: no molestar entre 00:00 y 09:00
-MUTE_HOURS = range(0, 9)
-
-# ==========================
-# HELPERS
-# ==========================
+# ==============================
+# Helpers
+# ==============================
 def now_local():
     return datetime.now(ZoneInfo(TZ_NAME))
 
+def within_quiet_hours():
+    h = now_local().hour
+    return 0 <= h < 9  # silencio entre medianoche y 9am
+
+# ==============================
+# Notificación
+# ==============================
 def notify(msg: str):
-    """Envia mensaje a Telegram respetando el horario de silencio."""
-    now = now_local()
-    if now.hour in MUTE_HOURS:
-        print(f"[{now}] ⏸️ Silenciado (no enviar): {msg}")
+    """Notificación que respeta silencio nocturno"""
+    if within_quiet_hours():
+        print("⏸️ Silenciado:", msg)
         return
     if BOT_TOKEN and CHAT_ID:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"})
-    print(f"[{now}] {msg}")
-
-# ==========================
-# MULTIFUNCIÓN: detectar funciones y su disponibilidad
-# ==========================
-FUNC_SELECTORS = [
-    "select",
-    "[role='listbox']",
-    ".MuiList-root",
-    ".aa-event-dates",
-    ".event-functions",
-]
-
-def _is_soldout_text(t: str) -> bool:
-    t = t.lower()
-    return any(x in t for x in ["agotado", "sold out", "sem disponibilidade", "sin disponibilidad"])
-
-def _is_disabled_attr(el_handle) -> bool:
-    try:
-        return bool(el_handle.get_attribute("disabled")) or \
-               (el_handle.get_attribute("aria-disabled") in ("true", "1"))
-    except Exception:
-        return False
-
-def list_functions(page):
-    """
-    Devuelve lista de funciones: [{"label": str, "element": locator, "soldout": bool}, ...]
-    Intenta soportar <select><option>, listas <li>, divs con role=option.
-    Siempre intenta abrir el dropdown antes de leer.
-    """
-    # Intentar abrir el desplegable
-    try:
-        for root_sel in FUNC_SELECTORS:
-            root = page.locator(root_sel)
-            if root.count() > 0:
-                root.first.click(timeout=1500, force=True)
-                page.wait_for_timeout(400)
-                break
-    except Exception:
-        pass
-
-    # 1) <select><option>
-    try:
-        sel = page.locator("select")
-        if sel.count() > 0:
-            opt = sel.locator("option")
-            out = []
-            for i in range(opt.count()):
-                o = opt.nth(i)
-                lbl = (o.inner_text(timeout=200) or o.get_attribute("label") or "").strip()
-                sold = _is_soldout_text(lbl) or _is_disabled_attr(o.element_handle())
-                out.append({"label": lbl, "element": o, "soldout": sold, "via": "select"})
-            if out:
-                return out, sel
-    except Exception:
-        pass
-
-    # 2) listbox / li / items
-    for root_sel in FUNC_SELECTORS[1:]:
         try:
-            root = page.locator(root_sel)
-            if root.count() == 0:
-                continue
-            items = root.locator("[role='option'], li, .item, .option")
-            if items.count() == 0:
-                continue
-            out = []
-            for i in range(items.count()):
-                it = items.nth(i)
-                txt = (it.inner_text(timeout=200) or "").strip()
-                sold = _is_soldout_text(txt) or _is_disabled_attr(it.element_handle())
-                out.append({"label": txt, "element": it, "soldout": sold, "via": "list"})
-            if out:
-                return out, root
-        except Exception:
-            continue
+            requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"},
+                timeout=20,
+            ).raise_for_status()
+        except Exception as e:
+            print("❌ Error Telegram:", e)
+    print(msg)
 
-    return [], None
+def notify_force(msg: str):
+    """Notificación que IGNORA silencio nocturno (para pruebas/ping)."""
+    if BOT_TOKEN and CHAT_ID:
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"},
+                timeout=20,
+            ).raise_for_status()
+        except Exception as e:
+            print("❌ Error Telegram (force):", e)
+    print(msg)
 
-def select_function_and_verify(page, item, via):
+# ==============================
+# Check disponibilidad
+# ==============================
+def check_url(url: str, page) -> list[str]:
     """
-    Selecciona una función y verifica si realmente hay botón de compra.
-    Devuelve True si disponible.
+    Devuelve lista de funciones con entradas disponibles.
+    Si está agotado -> devuelve lista vacía.
     """
-    try:
-        if via == "select":
-            val = item["element"].get_attribute("value")
-            item["element"].evaluate("(o) => o.parentElement.value = o.value")
-            item["element"].evaluate("(o) => o.parentElement.dispatchEvent(new Event('change', {bubbles: true}))")
-        else:
-            item["element"].click(timeout=2000, force=True)
-
-        page.wait_for_load_state("networkidle")
-        page.wait_for_timeout(800)
-
-        txt = page.evaluate("() => document.body.innerText").lower()
-        has_buy = any(k in txt for k in ["comprar", "comprar entradas", "buy tickets"])
-        has_sold = _is_soldout_text(txt)
-        return has_buy and not has_sold
-    except Exception:
-        return False
-
-# ==========================
-# CORE: chequeo de estado
-# ==========================
-def get_visible_status(page):
-    txt = page.evaluate("() => document.body.innerText").lower()
-    if "agotado" in txt and "comprar" not in txt:
-        return "SOLDOUT", None
-
-    # Check multifunción
-    funcs, root = list_functions(page)
     disponibles = []
+    try:
+        page.goto(url, timeout=60000)
+        page.wait_for_load_state("networkidle", timeout=15000)
 
-    if funcs:
-        for f in funcs:
-            label = f["label"] or "(sin etiqueta)"
-            if f["soldout"]:
-                continue
-            ok = select_function_and_verify(page, f, f["via"])
-            if ok:
-                lbl_clean = re.sub(r"\s+-\s+.*$", "", label).strip()
-                disponibles.append(lbl_clean)
+        # desplegar dropdown si existe
+        try:
+            dropdown = page.wait_for_selector("select", timeout=5000)
+            options = dropdown.query_selector_all("option")
+            for opt in options:
+                texto = opt.inner_text().strip()
+                if "Agotado" not in texto and texto != "":
+                    disponibles.append(texto)
+        except PWTimeout:
+            # puede ser single show (sin dropdown)
+            try:
+                btn = page.query_selector("button, a")
+                if btn and ("Comprar" in btn.inner_text() or "entradas" in btn.inner_text()):
+                    disponibles.append("Único show disponible")
+            except Exception:
+                pass
 
-        if disponibles:
-            unicos = []
-            for d in disponibles:
-                if d not in unicos:
-                    unicos.append(d)
-            return "AVAILABLE", ", ".join(unicos)
+    except Exception as e:
+        print(f"⚠️ Error al procesar {url}: {e}")
+    return disponibles
 
-    # Fallback: buscar botón global
-    has_buy = any(k in txt for k in ["comprar", "comprar entradas", "buy tickets"])
-    if has_buy:
-        return "AVAILABLE", "Disponible (sin fechas específicas)"
-    return "SOLDOUT", None
+# ==============================
+# Main loop
+# ==============================
+if __name__ == "__main__":
+    notify_force(f"🔎 Radar levantado (URLs: {len(URLS)}) — Roberto")
 
-# ==========================
-# LOOP PRINCIPAL
-# ==========================
-def run_monitor():
-    last_state = {}
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
 
         while True:
             for url in URLS:
-                try:
-                    page.goto(url, timeout=60000)
-                    page.wait_for_load_state("networkidle")
-                    page.wait_for_timeout(1200)
-
-                    state, detail = get_visible_status(page)
-                    if last_state.get(url) != state and state == "AVAILABLE":
-                        msg = f"✅ ¡Entradas disponibles!\n{url}"
-                        if detail:
-                            msg += f"\nFechas: {detail}"
-                        notify(msg)
-                    last_state[url] = state
-
-                except Exception as e:
-                    print(f"Error en {url}: {e}")
-
-            time.sleep(CHECK_EVERY_SECONDS)
-
-if __name__ == "__main__":
-    run_monitor()
+                shows = check_url(url, page)
+                if shows:
+                    notify(f"✅ Entradas disponibles en {url}\nFunciones: {', '.join(shows)}")
+                else:
+                    print(f"❌ Nada en {url} — {now_local()}")
+            time.sleep(CHECK_EVERY)
