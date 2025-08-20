@@ -5,7 +5,7 @@ import threading
 import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+from playwright.sync_api import sync_playwright
 
 # ==============================
 # Config
@@ -16,7 +16,7 @@ URLS = [u.strip() for u in os.getenv("MONITORED_URLS", "").split(",") if u.strip
 CHECK_EVERY = int(os.getenv("CHECK_EVERY_SECONDS", "300"))
 TZ_NAME = os.getenv("TIMEZONE", "America/Argentina/Buenos_Aires")
 PREFERRED_MARKET = os.getenv("PREFERRED_MARKET", "Argentina")
-MAX_FUTURE_MONTHS = int(os.getenv("MAX_FUTURE_MONTHS", "18"))  # horizonte de fechas válidas
+MAX_FUTURE_MONTHS = int(os.getenv("MAX_FUTURE_MONTHS", "18"))
 
 SIGN = " — Roberto"
 
@@ -172,31 +172,25 @@ def _looks_like_country(s: str) -> bool:
     return t in PAISES_COMUNES
 
 def _parse_date_str(s: str):
-    # s viene como dd/mm(/yyyy). devolvemos datetime con año si existe, sino None
     parts = s.split("/")
-    if len(parts) == 2:
-        dd, mm = int(parts[0]), int(parts[1])
-        # sin año → descartamos para estado final (no es fiable)
-        return None
-    try:
-        dd, mm, yy = int(parts[0]), int(parts[1]), int(parts[2])
-        return datetime(yy, mm, dd, tzinfo=ZoneInfo(TZ_NAME))
-    except Exception:
-        return None
+    if len(parts) == 3:
+        try:
+            dd, mm, yy = int(parts[0]), int(parts[1]), int(parts[2])
+            return datetime(yy, mm, dd, tzinfo=ZoneInfo(TZ_NAME))
+        except Exception:
+            return None
+    return None  # descartamos dd/mm sin año
 
 def filter_and_sort_dates(fecha_strs: list[str]) -> list[str]:
-    """Solo fechas futuras y dentro de MAX_FUTURE_MONTHS. Orden ascendente."""
     out = []
     now = now_local()
     horizon = now + timedelta(days=MAX_FUTURE_MONTHS*30)
     seen = set()
     for s in fecha_strs:
         dt = _parse_date_str(s)
-        if dt is None:  # si no tiene año, la descartamos (para evitar falsos positivos)
+        if not dt: 
             continue
-        if dt < now:  # pasado
-            continue
-        if dt > horizon:
+        if not (now < dt <= horizon):
             continue
         key = dt.strftime("%Y-%m-%d")
         if key in seen: 
@@ -226,7 +220,6 @@ FUNC_TRIGGERS = [
     "[role='button']:has-text('Fecha')",
     "[role='button']:has-text('Función')",
 ]
-
 CTA_BUY_SELECTORS = [
     "a:has-text('Comprar')",
     "a:has-text('Comprar entradas')",
@@ -236,8 +229,6 @@ CTA_BUY_SELECTORS = [
     "[data-testid*='buy']",
     "[href*='comprar']",
 ]
-
-# Donde suele estar el contenido útil (modal/dialog/drawer o panel de funciones)
 CONTAINERS_PRIORITARIOS = [
     "[role='dialog']",
     ".MuiDialog-root",
@@ -250,7 +241,6 @@ CONTAINERS_PRIORITARIOS = [
     ".event-functions",
     "[role='listbox']",
 ]
-
 PORTAL_SELECTORS = [
     ".MuiPopover-root .MuiMenu-list[role='listbox'] li[role='option']",
     ".MuiPopover-root [role='listbox'] li[role='option']",
@@ -301,15 +291,12 @@ def _select_preferred_market_if_present(page):
     ]
     for sel in candidates:
         try:
-            items = page.locator(sel)
-            n = items.count()
+            items = page.locator(sel); n = items.count()
             if n == 0: continue
             for i in range(min(n, 60)):
                 it = items.nth(i)
-                try:
-                    txt = (it.inner_text(timeout=200) or "").strip().lower()
-                except Exception:
-                    txt = ""
+                try: txt = (it.inner_text(timeout=200) or "").strip().lower()
+                except Exception: txt = ""
                 if not txt: continue
                 if txt in PAISES_COMUNES and target in txt:
                     it.click(timeout=1500, force=True)
@@ -340,28 +327,21 @@ def _list_functions_generic(page) -> list[str]:
     return []
 
 def _scan_dates_in_priority_containers(page) -> list[str]:
-    # concatenamos textos SOLO dentro de contenedores relevantes y extraemos fechas de esos textos
     textos = []
     for sel in CONTAINERS_PRIORITARIOS:
         try:
-            nodes = page.locator(sel)
-            n = nodes.count()
-            for i in range(min(n, 8)):  # no más de 8 contenedores
+            nodes = page.locator(sel); n = nodes.count()
+            for i in range(min(n, 8)):
                 node = nodes.nth(i)
-                try:
-                    txt = (node.inner_text(timeout=300) or "").strip()
-                except Exception:
-                    txt = ""
-                if txt:
-                    textos.append(txt)
+                try: txt = (node.inner_text(timeout=300) or "").strip()
+                except Exception: txt = ""
+                if txt: textos.append(txt)
         except Exception:
             continue
-    fechas = []
-    seen = set()
+    fechas, seen = [], set()
     for t in textos:
         for f in extract_dates_only(t):
-            if f not in seen:
-                seen.add(f); fechas.append(f)
+            if f not in seen: seen.add(f); fechas.append(f)
     return fechas
 
 def _scan_dates_anywhere(page) -> list[str]:
@@ -397,6 +377,24 @@ def _click_cta_buy_get_page(page):
             continue
     return page
 
+def _gather_all_dates_on(page) -> list[str]:
+    """
+    Junta fechas de: listbox/select + contenedores prioritarios + escaneo total.
+    """
+    dates = []
+    # 1) listbox/select
+    for lbl in _list_functions_generic(page):
+        if not lbl: continue
+        if _looks_like_country(lbl): continue
+        if any(k in lbl.lower() for k in ["agotado","sold out","sin disponibilidad","sem disponibilidade"]): continue
+        dates.extend(extract_dates_only(lbl))
+    # 2) contenedores del flujo
+    dates.extend(_scan_dates_in_priority_containers(page))
+    # 3) barrido general
+    dates.extend(_scan_dates_anywhere(page))
+    # limpiar, ordenar, filtrar
+    return filter_and_sort_dates(dates)
+
 # ==============================
 # Core: chequear una URL
 # ==============================
@@ -415,50 +413,26 @@ def check_url(url: str, page) -> tuple[list[str], str|None, str]:
             status_hint = "SOLDOUT"
 
         _select_preferred_market_if_present(page)
-
-        # 1) Intento directos (dropdown/listbox)
         _open_dropdown_if_any(page)
-        labels = _list_functions_generic(page)
-        if not labels:
-            # 2) Intento focalizado en contenedores del flujo
-            labels = _scan_dates_in_priority_containers(page)
-        if not labels:
-            # 3) CTA y repetir (popup o misma page)
+
+        # Recolectar TODO en la página original
+        fechas = _gather_all_dates_on(page)
+
+        # Si aún no hay fechas, intentar CTA (popup o inline) y repetir recolección
+        if not fechas:
             dest = _click_cta_buy_get_page(page)
             try: dest.wait_for_load_state("networkidle", timeout=6000)
             except Exception: pass
-
-            # si hay selects, intentar Argentina primero
+            # pequeño scroll por si hay lazy
             try:
-                if dest.locator("select").count() > 0:
-                    try:
-                        dest.select_option("select", label=PREFERRED_MARKET)
-                        dest.wait_for_timeout(300)
-                    except Exception:
-                        dest.select_option("select", value="AR"); dest.wait_for_timeout(300)
+                dest.mouse.wheel(0, 400); dest.wait_for_timeout(120)
+                dest.mouse.wheel(0, -400); dest.wait_for_timeout(120)
             except Exception:
                 pass
+            fechas = _gather_all_dates_on(dest)
 
-            labels = _list_functions_generic(dest)
-            if not labels:
-                labels = _scan_dates_in_priority_containers(dest)
-            if not labels:
-                labels = _scan_dates_anywhere(dest)
-
-        # labels puede ser lista de textos: extraemos y limpiamos fechas
-        tmp_fechas = []
-        for lbl in labels:
-            if not lbl: continue
-            if _looks_like_country(lbl):  continue
-            if any(k in lbl.lower() for k in ["agotado", "sold out", "sin disponibilidad", "sem disponibilidade"]):
-                continue
-            tmp_fechas.extend(extract_dates_only(lbl))
-
-        fechas = filter_and_sort_dates(tmp_fechas)
-
+        # Fallback honesto: AVAILABLE sin fecha solo si nada de lo anterior devolvió fechas
         if not fechas and page_has_buy(page):
-            # último fallback honesto
-            fechas = ["(sin fecha)"]
             status_hint = "AVAILABLE"
 
     except Exception as e:
@@ -467,7 +441,7 @@ def check_url(url: str, page) -> tuple[list[str], str|None, str]:
     return fechas, title, status_hint
 
 # ==============================
-# DEBUG (opcional)
+# DEBUG opcional
 # ==============================
 def debug_show_by_index(idx: int):
     url = URLS[idx - 1]
@@ -483,29 +457,20 @@ def debug_show_by_index(idx: int):
             _select_preferred_market_if_present(page)
             _open_dropdown_if_any(page)
 
-            a = _list_functions_generic(page)
-            b = _scan_dates_in_priority_containers(page)
-            c = _scan_dates_anywhere(page)
+            pre = _gather_all_dates_on(page)
 
             dest = _click_cta_buy_get_page(page)
             try: dest.wait_for_load_state("networkidle", timeout=6000)
             except Exception: pass
-
-            d = _list_functions_generic(dest)
-            e = _scan_dates_in_priority_containers(dest)
-            f = _scan_dates_anywhere(dest)
+            post = _gather_all_dates_on(dest)
 
             parts = [
                 f"🧪 DEBUG — {title}",
                 f"URL idx {idx}",
                 f"buy_detected={has_buy}, soldout_detected={has_sold}",
                 f"popup_opened={'yes' if dest is not page else 'no'}",
-                "pre_listbox: " + "; ".join(a[:10]) if a else "pre_listbox: -",
-                "pre_focus: " + "; ".join(filter_and_sort_dates(b)) if b else "pre_focus: -",
-                "pre_any: " + "; ".join(filter_and_sort_dates(c)) if c else "pre_any: -",
-                "post_listbox: " + "; ".join(d[:10]) if d else "post_listbox: -",
-                "post_focus: " + "; ".join(filter_and_sort_dates(e)) if e else "post_focus: -",
-                "post_any: " + "; ".join(filter_and_sort_dates(f)) if f else "post_any: -",
+                "pre: " + (", ".join(pre) if pre else "-"),
+                "post: " + (", ".join(post) if post else "-"),
             ]
             tg_send("\n".join(parts) + f"\n{SIGN}", force=True)
         except Exception as e:
@@ -594,12 +559,12 @@ def run_monitor():
                     else:
                         status = "SOLDOUT" if (status_hint == "SOLDOUT" and not page_has_buy(page)) \
                                  else ("AVAILABLE" if status_hint == "AVAILABLE" else "UNKNOWN")
-                        detail = "(sin fecha)" if status == "AVAILABLE" else None
+                        detail = None  # ya no mandamos "(sin fecha)" al snapshot; solo alertamos transición
                         LAST_RESULTS[url] = {"status": status, "detail": detail, "ts": ts, "title": title}
                         print(f"{'⛔' if status=='SOLDOUT' else ('✅' if status=='AVAILABLE' else '❓')} {title or url} — {ts}")
                         if status == "AVAILABLE" and prev_status != "AVAILABLE":
                             head = title or "Show"
-                            tg_send(f"✅ ¡Entradas disponibles!\n{head}\nFechas: {detail or '(sin fecha)'}\n{SIGN}")
+                            tg_send(f"✅ ¡Entradas disponibles!\n{head}\nFechas: (sin fecha visible)\n{SIGN}")
                 except Exception as e:
                     ts = now_local().strftime("%Y-%m-%d %H:%M:%S")
                     LAST_RESULTS[url] = {"status": "UNKNOWN", "detail": str(e), "ts": ts, "title": LAST_RESULTS.get(url, {}).get("title")}
