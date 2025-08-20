@@ -15,13 +15,13 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # string
 URLS = [u.strip() for u in os.getenv("MONITORED_URLS", "").split(",") if u.strip()]
 CHECK_EVERY = int(os.getenv("CHECK_EVERY_SECONDS", "300"))  # segundos
 TZ_NAME = os.getenv("TIMEZONE", "America/Argentina/Buenos_Aires")
-PREFERRED_MARKET = os.getenv("PREFERRED_MARKET", "Argentina")  # tabs/menús de país
+PREFERRED_MARKET = os.getenv("PREFERRED_MARKET", "Argentina")
+
 SIGN = " — Roberto"
 
 # ==============================
 # Estado global (cache)
 # ==============================
-# LAST_RESULTS[url] = {"status": "AVAILABLE"/"SOLDOUT"/"UNKNOWN", "detail": str|None, "ts": "...", "title": str|None}
 LAST_RESULTS = {u: {"status": "UNKNOWN", "detail": None, "ts": "", "title": None} for u in URLS}
 
 # ==============================
@@ -32,10 +32,9 @@ def now_local():
 
 def within_quiet_hours():
     h = now_local().hour
-    return 0 <= h < 9  # silencio 00:00–09:00
+    return 0 <= h < 9
 
 def tg_send(text: str, force: bool = False):
-    """Envía mensaje por Telegram. force=True ignora el silencio."""
     if not force and within_quiet_hours():
         print("⏸️ Silenciado:", text); return
     if BOT_TOKEN and CHAT_ID:
@@ -64,7 +63,6 @@ def page_has_buy(page) -> bool:
     return any(k in t for k in ["comprar", "comprar entradas", "buy tickets", "entradas"])
 
 def extract_title(page):
-    """Obtiene un título amigable (title u og:title) y limpia ' | All Access'."""
     title = ""
     try:
         title = (page.title() or "").strip()
@@ -129,86 +127,16 @@ def fmt_shows_indexed() -> str:
         lines.append(f"{i}) {label}" + ("" if ok else f"  ❗ {err}"))
     return "\n".join(lines)
 
-def _collect_options_debug(page):
-    """Devuelve un dict con las opciones crudas encontradas en distintos selectores."""
-    buckets = {}
-    # Portal MUI
-    try:
-        items = page.locator(".MuiPopover-root [role='listbox'] li[role='option']")
-        if items and items.count() > 0:
-            buckets["portal_listbox"] = [ (items.nth(i).inner_text() or "").strip() for i in range(min(items.count(), 15)) ]
-    except Exception:
-        pass
-    # Listbox normal
-    try:
-        items = page.locator("[role='listbox'] li[role='option']")
-        if items and items.count() > 0:
-            buckets["dom_listbox"] = [ (items.nth(i).inner_text() or "").strip() for i in range(min(items.count(), 15)) ]
-    except Exception:
-        pass
-    # Select/option
-    try:
-        items = page.locator("select option")
-        if items and items.count() > 0:
-            buckets["select_option"] = [ (items.nth(i).inner_text() or "").strip() for i in range(min(items.count(), 15)) ]
-    except Exception:
-        pass
-    return buckets
-
-def debug_show_by_index(idx: int):
-    """Navega al show idx, intenta abrir selector, y envía dump por Telegram (force=True)."""
-    url = URLS[idx - 1]
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        try:
-            page.goto(url, timeout=60000)
-            page.wait_for_load_state("networkidle", timeout=15000)
-            title = extract_title(page) or prettify_from_slug(url)
-            # pistas globales
-            has_buy = page_has_buy(page)
-            has_sold = page_has_soldout(page)
-
-            _select_preferred_market_if_present(page)
-            _open_dropdown_if_any(page)
-            # pequeño scroll para provocar lazy render
-            try:
-                page.mouse.wheel(0, 500); page.wait_for_timeout(150)
-                page.mouse.wheel(0, -500); page.wait_for_timeout(150)
-            except Exception:
-                pass
-
-            buckets = _collect_options_debug(page)
-            # mensaje
-            parts = [
-                f"🧪 DEBUG — {title}",
-                f"URL idx {idx}",
-                f"buy_detected={has_buy}, soldout_detected={has_sold}",
-            ]
-            for k, vals in buckets.items():
-                if not vals: 
-                    continue
-                joined = "; ".join([v.replace("\n"," ").strip() for v in vals])
-                parts.append(f"{k}: {joined}")
-            if len(parts) == 3:
-                parts.append("no options found in known selectors")
-
-            tg_send("\n".join(parts) + f"\n{SIGN}", force=True)
-        except Exception as e:
-            tg_send(f"🧪 DEBUG ERROR idx {idx}: {e}\n{SIGN}", force=True)
-        finally:
-            try: browser.close()
-            except Exception: pass
-	
-	
 # ==============================
-# Heurísticas fecha vs. países
+# Heurísticas fechas / países
 # ==============================
 PAISES_COMUNES = {"argentina","brasil","colombia","chile","uruguay","perú","peru","paraguay","bolivia","mexico","méxico","portugal","españa","otros","other","latam"}
+
 RE_NUMERIC_DATE = re.compile(r"\b(\d{1,2})[-/](\d{1,2})(?:[-/](\d{2,4}))?\b")
 RE_MONTH_NAME   = re.compile(r"\b(\d{1,2})\s+(?:de\s+)?(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)(?:\s+de)?\s+(\d{4})\b", re.IGNORECASE)
-
 MESES_ES = ["enero","febrero","marzo","abril","mayo","junio","julio","agosto","septiembre","octubre","noviembre","diciembre"]
+MESES_ABBR_ES = ["ene","feb","mar","abr","may","jun","jul","ago","sep","oct","nov","dic"]
+RE_MONTH_ABBR  = re.compile(r"\b(\d{1,2})\s*[-/ ]\s*(ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic)\s*[-/ ]\s*(\d{4})\b", re.IGNORECASE)
 
 def _month_to_num(m: str) -> int:
     m = m.strip().lower()
@@ -230,6 +158,15 @@ def extract_dates_only(text: str) -> list[str]:
         if not (1 <= dd <= 31 and 1 <= mm <= 12): continue
         s = f"{dd:02d}/{mm:02d}/{yy:04d}"
         if s not in seen: seen.add(s); out.append(s)
+    # 3) 14-Nov-2025 / 14 NOV 2025
+    for d, mes_abbr, y in RE_MONTH_ABBR.findall(text):
+        dd = int(d); mes_abbr = mes_abbr.lower()
+        try: mm = MESES_ABBR_ES.index(mes_abbr) + 1
+        except ValueError: mm = 0
+        if not (1 <= dd <= 31 and 1 <= mm <= 12): continue
+        yy = int(y)
+        s = f"{dd:02d}/{mm:02d}/{yy:04d}"
+        if s not in seen: seen.add(s); out.append(s)
     return out
 
 def _looks_like_country(s: str) -> bool:
@@ -242,30 +179,40 @@ def _looks_like_country(s: str) -> bool:
 FUNC_TRIGGERS = [
     "button[aria-haspopup='listbox']",
     "[role='combobox']",
+    "[aria-controls*='menu']",
     "[data-testid*='select']",
+    "div.MuiSelect-select",
     ".MuiSelect-select",
     "button:has-text('Seleccionar')",
     "button:has-text('Seleccioná')",
+    "button:has-text('Selecciona')",
+    "button:has-text('Elegí')",
+    "button:has-text('Elegi')",
     "button:has-text('Fecha')",
     "button:has-text('Función')",
+    "[role='button']:has-text('Fecha')",
+    "[role='button']:has-text('Función')",
 ]
 
-PORTAL_LISTBOX = [
+PORTAL_SELECTORS = [
     ".MuiPopover-root .MuiMenu-list[role='listbox'] li[role='option']",
     ".MuiPopover-root [role='listbox'] li[role='option']",
+    ".MuiMenu-paper [role='listbox'] li[role='option']",
+    ".MuiPaper-root [role='listbox'] li[role='option']",
+    ".MuiPopover-root li.MuiMenuItem-root",
+    ".MuiMenu-paper li.MuiMenuItem-root",
 ]
 
-LISTBOX_ROOTS = [
-    "[role='listbox'] li[role='option']",  # PRIMERO: listbox MUI dentro del DOM normal
-    "select option",                        # fallback <select>
+LISTBOX_SELECTORS = [
+    "[role='listbox'] li[role='option']",
+    "select option",
     ".MuiList-root li[role='option']",
     ".aa-event-dates [role='option']",
     ".event-functions [role='option']",
+    ".MuiList-root li.MuiMenuItem-root",
 ]
 
 def _open_dropdown_if_any(page):
-    """Intenta abrir el dropdown para que aparezcan opciones."""
-    # click en posibles triggers
     for trig in FUNC_TRIGGERS:
         try:
             loc = page.locator(trig).first
@@ -274,9 +221,13 @@ def _open_dropdown_if_any(page):
                 page.wait_for_timeout(250)
         except Exception:
             continue
+    # esperar popover o listbox
+    try:
+        page.wait_for_selector(".MuiPopover-root, .MuiMenu-paper, [role='listbox']", timeout=1200)
+    except Exception:
+        pass
 
 def _select_preferred_market_if_present(page):
-    """Si hay selector de países, clickea el preferido (ej. Argentina)."""
     target = (PREFERRED_MARKET or "").strip().lower()
     if not target: return
     candidates = [
@@ -307,79 +258,63 @@ def _select_preferred_market_if_present(page):
             continue
 
 def _list_functions_generic(page):
-    """
-    Devuelve lista de (label, element, via):
-      via='portal' si viene de un Popover/Portal MUI
-      via='list'   si viene de listbox en DOM normal
-      via='select' si viene de <select><option>
-    """
-    # 0) Listbox en PORTAL (MuiPopover)
+    # 0) Portal MUI
     try:
-        items = page.locator(", ".join(PORTAL_LISTBOX))
+        items = page.locator(", ".join(PORTAL_SELECTORS))
         if items and items.count() > 0:
             out = []
             for i in range(min(items.count(), 120)):
                 it = items.nth(i)
-                try:
-                    txt = (it.inner_text(timeout=250) or "").strip()
-                except Exception:
-                    txt = ""
-                if txt:
-                    out.append((txt, it, "portal"))
+                try: txt = (it.inner_text(timeout=250) or "").strip()
+                except Exception: txt = ""
+                if txt: out.append((txt, it, "portal"))
             if out: return out
     except Exception:
         pass
-
-    # 1) Listbox en DOM normal
-    for sel in LISTBOX_ROOTS:
+    # 1) DOM normal
+    for sel in LISTBOX_SELECTORS:
         try:
             items = page.locator(sel)
             if items and items.count() > 0:
                 out = []
                 for i in range(min(items.count(), 120)):
                     it = items.nth(i)
-                    try:
-                        txt = (it.inner_text(timeout=250) or "").strip()
-                    except Exception:
-                        txt = ""
-                    if txt:
-                        out.append((txt, it, "list" if "option" in sel else "select"))
+                    try: txt = (it.inner_text(timeout=250) or "").strip()
+                    except Exception: txt = ""
+                    if txt: out.append((txt, it, "list" if "option" in sel or "MenuItem" in sel else "select"))
                 if out: return out
         except Exception:
             continue
-
     return []
 
 # ==============================
 # Chequeo de una URL
 # ==============================
 def check_url(url: str, page) -> tuple[list[str], str|None, str]:
-    """
-    Devuelve (fechas[], titulo, status_hint):
-      - fechas: lista de fechas normalizadas dd/mm(/yyyy)
-      - status_hint: 'AVAILABLE' si detecta compra explícitamente, 'SOLDOUT' si detecta Agotado explícito, 'UNKNOWN' si no
-    """
     fechas, title = [], None
     status_hint = "UNKNOWN"
-
     try:
         page.goto(url, timeout=60000)
         page.wait_for_load_state("networkidle", timeout=15000)
 
-        # Título
         title = extract_title(page)
 
-        # pistas globales
+        # pistas globales antes de abrir menú
         if page_has_buy(page):
             status_hint = "AVAILABLE"
         elif page_has_soldout(page):
             status_hint = "SOLDOUT"
 
-        # País preferido
         _select_preferred_market_if_present(page)
-
-        # Abrir dropdown y enumerar opciones
         _open_dropdown_if_any(page)
+
+        # pequeño scroll para forzar lazy render
+        try:
+            page.mouse.wheel(0, 400); page.wait_for_timeout(120)
+            page.mouse.wheel(0, -400); page.wait_for_timeout(120)
+        except Exception:
+            pass
+
         funcs = _list_functions_generic(page)
 
         def is_soldout_label(s: str) -> bool:
@@ -389,18 +324,14 @@ def check_url(url: str, page) -> tuple[list[str], str|None, str]:
         if funcs:
             for lbl, el, via in funcs:
                 if not lbl: continue
-                if _looks_like_country(lbl):  # evitar países
-                    continue
-                if is_soldout_label(lbl):
-                    continue
-                found = extract_dates_only(lbl)
-                for f in found:
+                if _looks_like_country(lbl):  continue
+                if is_soldout_label(lbl):     continue
+                for f in extract_dates_only(lbl):
                     if f not in fechas:
                         fechas.append(f)
-
         else:
-            # Fallback show único: botón compra (sin fecha)
-            if page_has_buy(page) and "(sin fecha)" not in fechas:
+            # Fallback: si hay botón de compra pero no fechas visibles, marcamos sin fecha
+            if page_has_buy(page):
                 fechas.append("(sin fecha)")
                 status_hint = "AVAILABLE"
 
@@ -410,8 +341,75 @@ def check_url(url: str, page) -> tuple[list[str], str|None, str]:
     return fechas, title, status_hint
 
 # ==============================
-# Telegram polling (/status [n], /shows)
+# Telegram polling (/status [n], /shows, /debug n)
 # ==============================
+def _collect_options_debug(page):
+    buckets = {}
+    try:
+        items = page.locator(", ".join(PORTAL_SELECTORS))
+        if items and items.count() > 0:
+            buckets["portal_listbox"] = [ (items.nth(i).inner_text() or "").strip() for i in range(min(items.count(), 15)) ]
+    except Exception:
+        pass
+    try:
+        items = page.locator("[role='listbox'] li[role='option']")
+        if items and items.count() > 0:
+            buckets["dom_listbox"] = [ (items.nth(i).inner_text() or "").strip() for i in range(min(items.count(), 15)) ]
+    except Exception:
+        pass
+    try:
+        items = page.locator("select option")
+        if items and items.count() > 0:
+            buckets["select_option"] = [ (items.nth(i).inner_text() or "").strip() for i in range(min(items.count(), 15)) ]
+    except Exception:
+        pass
+    try:
+        items = page.locator(".MuiMenu-paper li.MuiMenuItem-root, .MuiPopover-root li.MuiMenuItem-root")
+        if items and items.count() > 0:
+            buckets["mui_menuitem"] = [ (items.nth(i).inner_text() or "").strip() for i in range(min(items.count(), 15)) ]
+    except Exception:
+        pass
+    return buckets
+
+def debug_show_by_index(idx: int):
+    url = URLS[idx - 1]
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        try:
+            page.goto(url, timeout=60000)
+            page.wait_for_load_state("networkidle", timeout=15000)
+            title = extract_title(page) or prettify_from_slug(url)
+            has_buy = page_has_buy(page)
+            has_sold = page_has_soldout(page)
+
+            _select_preferred_market_if_present(page)
+            _open_dropdown_if_any(page)
+            try:
+                page.mouse.wheel(0, 500); page.wait_for_timeout(150)
+                page.mouse.wheel(0, -500); page.wait_for_timeout(150)
+            except Exception:
+                pass
+
+            buckets = _collect_options_debug(page)
+            parts = [
+                f"🧪 DEBUG — {title}",
+                f"URL idx {idx}",
+                f"buy_detected={has_buy}, soldout_detected={has_sold}",
+            ]
+            for k, vals in buckets.items():
+                if vals:
+                    joined = "; ".join([v.replace("\n"," ").strip() for v in vals])
+                    parts.append(f"{k}: {joined}")
+            if len(parts) == 3:
+                parts.append("no options found in known selectors")
+            tg_send("\n".join(parts) + f"\n{SIGN}", force=True)
+        except Exception as e:
+            tg_send(f"🧪 DEBUG ERROR idx {idx}: {e}\n{SIGN}", force=True)
+        finally:
+            try: browser.close()
+            except Exception: pass
+
 def telegram_polling():
     if not (BOT_TOKEN and CHAT_ID):
         print("ℹ️ Telegram polling desactivado (faltan credenciales)."); return
@@ -419,7 +417,6 @@ def telegram_polling():
     offset = None
     api = f"https://api.telegram.org/bot{BOT_TOKEN}"
     print("🛰️ Telegram polling iniciado.")
-
     while True:
         try:
             params = {"timeout": 50}
@@ -436,7 +433,6 @@ def telegram_polling():
                 chat = msg.get("chat", {})
                 text = (msg.get("text") or "").strip()
                 chat_id = str(chat.get("id") or "")
-
                 if not text or chat_id != str(CHAT_ID): continue
 
                 tlow = text.lower()
@@ -456,13 +452,13 @@ def telegram_polling():
                     else:
                         snap = LAST_RESULTS.copy()
                         tg_send(fmt_status_snapshot(snap), force=True)
+
                 elif tlow.startswith("/debug"):
                     m = re.match(r"^/debug\s+(\d+)\s*$", tlow)
                     if m:
                         idx = int(m.group(1))
                         if 1 <= idx <= len(URLS):
                             tg_send(f"⏳ Corriendo debug del show #{idx}…{SIGN}", force=True)
-                            # correr en hilo aparte para no bloquear el polling
                             threading.Thread(target=debug_show_by_index, args=(idx,), daemon=True).start()
                         else:
                             tg_send(f"Índice fuera de rango (1–{len(URLS)}).{SIGN}", force=True)
@@ -474,21 +470,18 @@ def telegram_polling():
             time.sleep(5)
 
 # ==============================
-# Main loop del monitor
+# Main loop
 # ==============================
 def run_monitor():
     tg_send(f"🔎 Radar levantado (URLs: {len(URLS)}){SIGN}", force=True)
-
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
-
         while True:
             for url in URLS:
                 try:
                     fechas, title, status_hint = check_url(url, page)
                     ts = now_local().strftime("%Y-%m-%d %H:%M:%S")
-
                     prev_status = LAST_RESULTS.get(url, {}).get("status", "UNKNOWN")
 
                     if fechas:
@@ -496,35 +489,22 @@ def run_monitor():
                         if prev_status != "AVAILABLE":
                             head = title or "Show"
                             tg_send(f"✅ ¡Entradas disponibles!\n{head}\nFechas: {det}\n{SIGN}")
-                        LAST_RESULTS[url] = {
-                            "status": "AVAILABLE",
-                            "detail": det,
-                            "ts": ts,
-                            "title": title
-                        }
+                        LAST_RESULTS[url] = {"status": "AVAILABLE", "detail": det, "ts": ts, "title": title}
                     else:
-                        # Si no levantamos fechas:
-                        # - Si hay 'Agotado' explícito y NO hay 'Comprar' → SOLDOUT
-                        # - En cualquier otra duda → UNKNOWN (no te miento)
-                        status = "SOLDOUT" if (status_hint == "SOLDOUT" and not page_has_buy(page)) else "UNKNOWN"
-                        LAST_RESULTS[url] = {
-                            "status": status,
-                            "detail": None,
-                            "ts": ts,
-                            "title": title
-                        }
-                        print(f"{'⛔' if status=='SOLDOUT' else '❓'} {title or url} — {ts}")
+                        status = "SOLDOUT" if (status_hint == "SOLDOUT" and not page_has_buy(page)) else ("AVAILABLE" if status_hint == "AVAILABLE" else "UNKNOWN")
+                        detail = "(sin fecha)" if status == "AVAILABLE" else None
+                        LAST_RESULTS[url] = {"status": status, "detail": detail, "ts": ts, "title": title}
+                        print(f"{'⛔' if status=='SOLDOUT' else ('✅' if status=='AVAILABLE' else '❓')} {title or url} — {ts}")
+
+                        # Notificar transición a AVAILABLE aunque no tengamos fechas
+                        if status == "AVAILABLE" and prev_status != "AVAILABLE":
+                            head = title or "Show"
+                            tg_send(f"✅ ¡Entradas disponibles!\n{head}\nFechas: {detail or '(sin fecha)'}\n{SIGN}")
 
                 except Exception as e:
                     ts = now_local().strftime("%Y-%m-%d %H:%M:%S")
-                    LAST_RESULTS[url] = {
-                        "status": "UNKNOWN",
-                        "detail": str(e),
-                        "ts": ts,
-                        "title": LAST_RESULTS.get(url, {}).get("title")
-                    }
+                    LAST_RESULTS[url] = {"status": "UNKNOWN", "detail": str(e), "ts": ts, "title": LAST_RESULTS.get(url, {}).get("title")}
                     print(f"💥 Error en {url}: {e}")
-
             time.sleep(CHECK_EVERY)
 
 # ==============================
