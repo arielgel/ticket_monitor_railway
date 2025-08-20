@@ -456,9 +456,15 @@ def debug_show_by_index(idx: int):
                 return None
 
             for k, vals in buckets1.items():
-                s = _flat(k, vals);  if s: parts.append(s)
+                s = _flat(k, vals)
+                if s:
+                    parts.append(s)
+
             for k, vals in buckets2.items():
-                s = _flat(k, vals);  if s: parts.append(s)
+                s = _flat(k, vals)
+                if s:
+                    parts.append(s)
+
             if len(parts) == 4:
                 parts.append("no options or dates found (pre/post CTA)")
 
