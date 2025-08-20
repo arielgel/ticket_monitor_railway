@@ -106,9 +106,8 @@ def fmt_status_snapshot(snap: dict) -> str:
 def quick_url_check(url: str) -> tuple[bool, str]:
     """
     Chequeo rápido HTTP para /shows:
-      True -> 2xx/3xx (probablemente válida)
-      False -> 4xx/5xx o error de red (inaccesible/typo)
-      dev: devuelve (ok, etiqueta_error_si_hay)
+      True -> 2xx/3xx
+      False -> 4xx/5xx o error de red
     """
     try:
         r = requests.get(url, timeout=6, allow_redirects=True, headers={"User-Agent":"Mozilla/5.0"})
@@ -124,7 +123,6 @@ def fmt_shows_indexed() -> str:
     if not URLS:
         lines.append("(no hay URLs configuradas)")
         return "\n".join(lines)
-
     for i, u in enumerate(URLS, start=1):
         title = (LAST_RESULTS.get(u) or {}).get("title")
         label = title or prettify_from_slug(u)
@@ -136,35 +134,130 @@ def fmt_shows_indexed() -> str:
     return "\n".join(lines)
 
 # ==============================
+# Dropdown/listbox (abrir y enumerar funciones)
+# ==============================
+FUNC_TRIGGERS = [
+    "button[aria-haspopup='listbox']",
+    "[role='combobox']",
+    "[data-testid*='select']",
+    ".MuiSelect-select",       # Material UI
+    ".aa-event-dates",         # clases comunes
+    ".event-functions",        # genérico
+]
+
+LISTBOX_ROOTS = [
+    "select",                  # <select>
+    "[role='listbox']",
+    ".MuiList-root",
+    ".aa-event-dates",
+    ".event-functions",
+]
+
+def _open_dropdown_if_any(page):
+    """Intenta abrir el dropdown para que aparezcan opciones."""
+    for trig in FUNC_TRIGGERS:
+        try:
+            loc = page.locator(trig).first
+            if loc and loc.count() > 0:
+                loc.click(timeout=1500, force=True)
+                page.wait_for_timeout(300)
+                # no rompemos el loop: podemos tener varios triggers apilados
+        except Exception:
+            continue
+
+def _list_functions_generic(page):
+    """
+    Devuelve lista de (label, element, via) para funciones:
+      via='select' si viene de <select><option>
+      via='list'   si viene de listbox/listas
+    """
+    # 1) <select><option>
+    try:
+        sel = page.locator("select").first
+        if sel and sel.count() > 0:
+            opts = sel.locator("option")
+            out = []
+            for i in range(opts.count()):
+                o = opts.nth(i)
+                try:
+                    lbl = (o.inner_text(timeout=200) or o.get_attribute("label") or "").strip()
+                except Exception:
+                    lbl = (o.get_attribute("label") or "").strip()
+                out.append((lbl, o, "select"))
+            if out:
+                return out
+    except Exception:
+        pass
+
+    # 2) listbox/listas
+    for root in LISTBOX_ROOTS[1:]:
+        try:
+            container = page.locator(root).first
+            if not container or container.count() == 0:
+                continue
+            items = container.locator("[role='option'], li, .item, .option, a, button")
+            if items.count() == 0:
+                continue
+            out = []
+            for i in range(min(items.count(), 80)):
+                it = items.nth(i)
+                try:
+                    txt = (it.inner_text(timeout=250) or "").strip()
+                except Exception:
+                    txt = ""
+                if not txt:
+                    continue
+                out.append((txt, it, "list"))
+            if out:
+                return out
+        except Exception:
+            continue
+
+    return []
+
+# ==============================
 # Chequeo de una URL
 # ==============================
 def check_url(url: str, page) -> tuple[list[str], str|None]:
     """
     Devuelve (lista_de_funciones_disponibles, titulo_del_show_o_None).
-    Heurística:
-      - Si hay <select>, toma opciones que NO contengan 'Agotado'.
-      - Si no hay <select>, busca botón con 'Comprar'/'Entradas'/'Buy'.
+    Soporta:
+      - <select><option>
+      - listbox con role=option (requiere abrir antes)
+      - show único (sin dropdown)
     """
     disponibles = []
     title = None
+
     try:
         page.goto(url, timeout=60000)
         page.wait_for_load_state("networkidle", timeout=15000)
 
+        # Título
         title = extract_title(page)
 
-        # Intentar <select> (múltiples funciones)
-        try:
-            dropdown = page.wait_for_selector("select", timeout=3000)
-            options = dropdown.query_selector_all("option")
-            for opt in options:
-                texto = (opt.inner_text() or "").strip()
-                if texto and ("agotado" not in texto.lower()):
-                    disponibles.append(texto)
-        except PWTimeout:
-            # Show único: buscar botón
+        # Abrir dropdown si existe
+        _open_dropdown_if_any(page)
+
+        # Enumerar funciones
+        funcs = _list_functions_generic(page)
+
+        def is_soldout_label(s: str) -> bool:
+            s = s.lower()
+            return any(k in s for k in ["agotado", "sold out", "sin disponibilidad", "sem disponibilidade"])
+
+        if funcs:
+            for lbl, el, via in funcs:
+                if not lbl or is_soldout_label(lbl):
+                    continue
+                # Normalizar etiqueta (quita sufijos tipo " — ...")
+                lbl_clean = re.sub(r"\s+—\s+.*$", "", lbl).strip()
+                if lbl_clean and lbl_clean not in disponibles:
+                    disponibles.append(lbl_clean)
+        else:
+            # No hay dropdown: show único → buscar botón compra
             try:
-                for btn in page.query_selector_all("button, a")[:80]:
+                for btn in page.query_selector_all("button, a")[:100]:
                     t = (btn.inner_text() or "").lower()
                     if any(k in t for k in ["comprar", "entradas", "buy"]):
                         disponibles.append("Único show disponible")
@@ -174,6 +267,7 @@ def check_url(url: str, page) -> tuple[list[str], str|None]:
 
     except Exception as e:
         print(f"⚠️ Error al procesar {url}: {e}")
+
     return disponibles, title
 
 # ==============================
