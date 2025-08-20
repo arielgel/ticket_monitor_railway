@@ -3,28 +3,30 @@ import re
 import time
 import threading
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 # ==============================
-# Configuración
+# Config
 # ==============================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # string
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 URLS = [u.strip() for u in os.getenv("MONITORED_URLS", "").split(",") if u.strip()]
-CHECK_EVERY = int(os.getenv("CHECK_EVERY_SECONDS", "300"))  # segundos
+CHECK_EVERY = int(os.getenv("CHECK_EVERY_SECONDS", "300"))
 TZ_NAME = os.getenv("TIMEZONE", "America/Argentina/Buenos_Aires")
 PREFERRED_MARKET = os.getenv("PREFERRED_MARKET", "Argentina")
+MAX_FUTURE_MONTHS = int(os.getenv("MAX_FUTURE_MONTHS", "18"))  # horizonte de fechas válidas
+
 SIGN = " — Roberto"
 
 # ==============================
-# Estado global (cache)
+# Estado
 # ==============================
 LAST_RESULTS = {u: {"status": "UNKNOWN", "detail": None, "ts": "", "title": None} for u in URLS}
 
 # ==============================
-# Helpers generales
+# Utilitarios
 # ==============================
 def now_local():
     return datetime.now(ZoneInfo(TZ_NAME))
@@ -169,6 +171,41 @@ def _looks_like_country(s: str) -> bool:
     t = s.strip().lower().replace("ó","o")
     return t in PAISES_COMUNES
 
+def _parse_date_str(s: str):
+    # s viene como dd/mm(/yyyy). devolvemos datetime con año si existe, sino None
+    parts = s.split("/")
+    if len(parts) == 2:
+        dd, mm = int(parts[0]), int(parts[1])
+        # sin año → descartamos para estado final (no es fiable)
+        return None
+    try:
+        dd, mm, yy = int(parts[0]), int(parts[1]), int(parts[2])
+        return datetime(yy, mm, dd, tzinfo=ZoneInfo(TZ_NAME))
+    except Exception:
+        return None
+
+def filter_and_sort_dates(fecha_strs: list[str]) -> list[str]:
+    """Solo fechas futuras y dentro de MAX_FUTURE_MONTHS. Orden ascendente."""
+    out = []
+    now = now_local()
+    horizon = now + timedelta(days=MAX_FUTURE_MONTHS*30)
+    seen = set()
+    for s in fecha_strs:
+        dt = _parse_date_str(s)
+        if dt is None:  # si no tiene año, la descartamos (para evitar falsos positivos)
+            continue
+        if dt < now:  # pasado
+            continue
+        if dt > horizon:
+            continue
+        key = dt.strftime("%Y-%m-%d")
+        if key in seen: 
+            continue
+        seen.add(key)
+        out.append(dt)
+    out.sort()
+    return [d.strftime("%d/%m/%Y") for d in out]
+
 # ==============================
 # Selectores UI
 # ==============================
@@ -200,6 +237,20 @@ CTA_BUY_SELECTORS = [
     "[href*='comprar']",
 ]
 
+# Donde suele estar el contenido útil (modal/dialog/drawer o panel de funciones)
+CONTAINERS_PRIORITARIOS = [
+    "[role='dialog']",
+    ".MuiDialog-root",
+    ".MuiDialog-container",
+    ".MuiDrawer-root",
+    ".MuiPaper-root.MuiDialog-paper",
+    ".MuiPopover-root",
+    ".MuiMenu-paper",
+    ".aa-event-dates",
+    ".event-functions",
+    "[role='listbox']",
+]
+
 PORTAL_SELECTORS = [
     ".MuiPopover-root .MuiMenu-list[role='listbox'] li[role='option']",
     ".MuiPopover-root [role='listbox'] li[role='option']",
@@ -220,6 +271,9 @@ SCAN_ANYWHERE_SELECTORS = [
     "button", "a", "li", "div", "span", "[class*=date]", "[class*=fecha]", "[data-testid*=date]"
 ]
 
+# ==============================
+# Interacciones UI
+# ==============================
 def _open_dropdown_if_any(page):
     for trig in FUNC_TRIGGERS:
         try:
@@ -257,7 +311,7 @@ def _select_preferred_market_if_present(page):
                 except Exception:
                     txt = ""
                 if not txt: continue
-                if _looks_like_country(txt) and target in txt:
+                if txt in PAISES_COMUNES and target in txt:
                     it.click(timeout=1500, force=True)
                     page.wait_for_load_state("networkidle"); page.wait_for_timeout(250)
                     return
@@ -285,6 +339,31 @@ def _list_functions_generic(page) -> list[str]:
             return labels
     return []
 
+def _scan_dates_in_priority_containers(page) -> list[str]:
+    # concatenamos textos SOLO dentro de contenedores relevantes y extraemos fechas de esos textos
+    textos = []
+    for sel in CONTAINERS_PRIORITARIOS:
+        try:
+            nodes = page.locator(sel)
+            n = nodes.count()
+            for i in range(min(n, 8)):  # no más de 8 contenedores
+                node = nodes.nth(i)
+                try:
+                    txt = (node.inner_text(timeout=300) or "").strip()
+                except Exception:
+                    txt = ""
+                if txt:
+                    textos.append(txt)
+        except Exception:
+            continue
+    fechas = []
+    seen = set()
+    for t in textos:
+        for f in extract_dates_only(t):
+            if f not in seen:
+                seen.add(f); fechas.append(f)
+    return fechas
+
 def _scan_dates_anywhere(page) -> list[str]:
     labels = _collect_options_from(page, SCAN_ANYWHERE_SELECTORS)
     fechas, seen = [], set()
@@ -297,10 +376,7 @@ def _scan_dates_anywhere(page) -> list[str]:
     return fechas
 
 def _click_cta_buy_get_page(page):
-    """
-    Click en CTA de compra. Si abre popup, devuelve la nueva page; si no, devuelve la actual.
-    """
-    # 1) intentamos con expect_popup
+    # si abre popup, seguimos ahí; si no, misma page
     for sel in CTA_BUY_SELECTORS:
         try:
             el = page.locator(sel).first
@@ -309,25 +385,20 @@ def _click_cta_buy_get_page(page):
                     with page.expect_popup() as pinfo:
                         el.click(timeout=1500, force=True)
                     popup = pinfo.value
-                    try:
-                        popup.wait_for_load_state("domcontentloaded", timeout=5000)
-                    except Exception:
-                        pass
+                    try: popup.wait_for_load_state("domcontentloaded", timeout=5000)
+                    except Exception: pass
                     return popup
                 except Exception:
-                    # 2) si no hubo popup, clic y quedamos en la misma page (o navega)
                     el.click(timeout=1500, force=True)
-                    try:
-                        page.wait_for_load_state("domcontentloaded", timeout=5000)
-                    except Exception:
-                        pass
+                    try: page.wait_for_load_state("domcontentloaded", timeout=5000)
+                    except Exception: pass
                     return page
         except Exception:
             continue
-    return page  # no encontró CTA
+    return page
 
 # ==============================
-# Chequeo de una URL
+# Core: chequear una URL
 # ==============================
 def check_url(url: str, page) -> tuple[list[str], str|None, str]:
     fechas, title = [], None
@@ -345,54 +416,49 @@ def check_url(url: str, page) -> tuple[list[str], str|None, str]:
 
         _select_preferred_market_if_present(page)
 
-        # Intento 1: abrir dropdowns de funciones en la page original
+        # 1) Intento directos (dropdown/listbox)
         _open_dropdown_if_any(page)
         labels = _list_functions_generic(page)
         if not labels:
-            labels = _scan_dates_anywhere(page)
-
-        # Intento 2: si nada, clic al CTA de compra y rascar en el destino (popup o misma page)
+            # 2) Intento focalizado en contenedores del flujo
+            labels = _scan_dates_in_priority_containers(page)
         if not labels:
+            # 3) CTA y repetir (popup o misma page)
             dest = _click_cta_buy_get_page(page)
-            try:
-                dest.wait_for_load_state("networkidle", timeout=6000)
-            except Exception:
-                pass
-            # si hay selector de país en checkout, forzar "Argentina" si existe
+            try: dest.wait_for_load_state("networkidle", timeout=6000)
+            except Exception: pass
+
+            # si hay selects, intentar Argentina primero
             try:
                 if dest.locator("select").count() > 0:
-                    # preferimos label
                     try:
                         dest.select_option("select", label=PREFERRED_MARKET)
                         dest.wait_for_timeout(300)
                     except Exception:
-                        # fallback por value común
-                        dest.select_option("select", value="AR")
-                        dest.wait_for_timeout(300)
+                        dest.select_option("select", value="AR"); dest.wait_for_timeout(300)
             except Exception:
                 pass
 
-            # buscar opciones/listas y, si no, escanear textos con fechas
             labels = _list_functions_generic(dest)
+            if not labels:
+                labels = _scan_dates_in_priority_containers(dest)
             if not labels:
                 labels = _scan_dates_anywhere(dest)
 
-        # Filtrar/agregar fechas
-        def is_soldout_label(s: str) -> bool:
-            s = s.lower()
-            return any(k in s for k in ["agotado", "sold out", "sin disponibilidad", "sem disponibilidade"])
-
+        # labels puede ser lista de textos: extraemos y limpiamos fechas
+        tmp_fechas = []
         for lbl in labels:
             if not lbl: continue
             if _looks_like_country(lbl):  continue
-            if is_soldout_label(lbl):     continue
-            for f in extract_dates_only(lbl):
-                if f not in fechas:
-                    fechas.append(f)
+            if any(k in lbl.lower() for k in ["agotado", "sold out", "sin disponibilidad", "sem disponibilidade"]):
+                continue
+            tmp_fechas.extend(extract_dates_only(lbl))
 
-        # fallback honesto
+        fechas = filter_and_sort_dates(tmp_fechas)
+
         if not fechas and page_has_buy(page):
-            fechas.append("(sin fecha)")
+            # último fallback honesto
+            fechas = ["(sin fecha)"]
             status_hint = "AVAILABLE"
 
     except Exception as e:
@@ -401,26 +467,8 @@ def check_url(url: str, page) -> tuple[list[str], str|None, str]:
     return fechas, title, status_hint
 
 # ==============================
-# DEBUG helpers
+# DEBUG (opcional)
 # ==============================
-def _collect_options_debug(page):
-    return {
-        "portal_listbox": _collect_options_from(page, PORTAL_SELECTORS)[:15],
-        "dom_listbox":    _collect_options_from(page, ["[role='listbox'] li[role='option']"])[:15],
-        "select_option":  _collect_options_from(page, ["select option"])[:15],
-        "scan_anywhere":  _scan_dates_anywhere(page)[:15],
-    }
-
-def _collect_options_debug_after_cta(page):
-    dest = _click_cta_buy_get_page(page)
-    time.sleep(0.2)
-    return dest, {
-        "afterCTA_portal": _collect_options_from(dest, PORTAL_SELECTORS)[:15],
-        "afterCTA_dom":    _collect_options_from(dest, ["[role='listbox'] li[role='option']"])[:15],
-        "afterCTA_select": _collect_options_from(dest, ["select option"])[:15],
-        "afterCTA_scan":   _scan_dates_anywhere(dest)[:15],
-    }
-
 def debug_show_by_index(idx: int):
     url = URLS[idx - 1]
     with sync_playwright() as p:
@@ -430,44 +478,35 @@ def debug_show_by_index(idx: int):
             page.goto(url, timeout=60000)
             page.wait_for_load_state("networkidle", timeout=15000)
             title = extract_title(page) or prettify_from_slug(url)
-            has_buy = page_has_buy(page)
-            has_sold = page_has_soldout(page)
+            has_buy = page_has_buy(page); has_sold = page_has_soldout(page)
 
             _select_preferred_market_if_present(page)
             _open_dropdown_if_any(page)
-            try:
-                page.mouse.wheel(0, 500); page.wait_for_timeout(150)
-                page.mouse.wheel(0, -500); page.wait_for_timeout(150)
-            except Exception:
-                pass
 
-            buckets1 = _collect_options_debug(page)
-            dest, buckets2 = _collect_options_debug_after_cta(page)
+            a = _list_functions_generic(page)
+            b = _scan_dates_in_priority_containers(page)
+            c = _scan_dates_anywhere(page)
+
+            dest = _click_cta_buy_get_page(page)
+            try: dest.wait_for_load_state("networkidle", timeout=6000)
+            except Exception: pass
+
+            d = _list_functions_generic(dest)
+            e = _scan_dates_in_priority_containers(dest)
+            f = _scan_dates_anywhere(dest)
 
             parts = [
                 f"🧪 DEBUG — {title}",
                 f"URL idx {idx}",
                 f"buy_detected={has_buy}, soldout_detected={has_sold}",
                 f"popup_opened={'yes' if dest is not page else 'no'}",
+                "pre_listbox: " + "; ".join(a[:10]) if a else "pre_listbox: -",
+                "pre_focus: " + "; ".join(filter_and_sort_dates(b)) if b else "pre_focus: -",
+                "pre_any: " + "; ".join(filter_and_sort_dates(c)) if c else "pre_any: -",
+                "post_listbox: " + "; ".join(d[:10]) if d else "post_listbox: -",
+                "post_focus: " + "; ".join(filter_and_sort_dates(e)) if e else "post_focus: -",
+                "post_any: " + "; ".join(filter_and_sort_dates(f)) if f else "post_any: -",
             ]
-            def _flat(name, vals):
-                if vals:
-                    return f"{name}: " + "; ".join([v.replace('\n',' ').strip() for v in vals])
-                return None
-
-            for k, vals in buckets1.items():
-                s = _flat(k, vals)
-                if s:
-                    parts.append(s)
-
-            for k, vals in buckets2.items():
-                s = _flat(k, vals)
-                if s:
-                    parts.append(s)
-
-            if len(parts) == 4:
-                parts.append("no options or dates found (pre/post CTA)")
-
             tg_send("\n".join(parts) + f"\n{SIGN}", force=True)
         except Exception as e:
             tg_send(f"🧪 DEBUG ERROR idx {idx}: {e}\n{SIGN}", force=True)
@@ -476,12 +515,11 @@ def debug_show_by_index(idx: int):
             except Exception: pass
 
 # ==============================
-# Telegram polling
+# Telegram
 # ==============================
 def telegram_polling():
     if not (BOT_TOKEN and CHAT_ID):
         print("ℹ️ Telegram polling desactivado (faltan credenciales)."); return
-
     offset = None
     api = f"https://api.telegram.org/bot{BOT_TOKEN}"
     print("🛰️ Telegram polling iniciado.")
@@ -494,7 +532,6 @@ def telegram_polling():
             data = r.json()
             if not data.get("ok"):
                 time.sleep(3); continue
-
             for upd in data.get("result", []):
                 offset = upd["update_id"] + 1
                 msg = upd.get("message") or {}
@@ -502,11 +539,9 @@ def telegram_polling():
                 text = (msg.get("text") or "").strip()
                 chat_id = str(chat.get("id") or "")
                 if not text or chat_id != str(CHAT_ID): continue
-
                 tlow = text.lower()
                 if tlow.startswith("/shows"):
                     tg_send(fmt_shows_indexed(), force=True)
-
                 elif tlow.startswith("/status"):
                     m = re.match(r"^/status\s+(\d+)\s*$", tlow)
                     if m:
@@ -520,7 +555,6 @@ def telegram_polling():
                     else:
                         snap = LAST_RESULTS.copy()
                         tg_send(fmt_status_snapshot(snap), force=True)
-
                 elif tlow.startswith("/debug"):
                     m = re.match(r"^/debug\s+(\d+)\s*$", tlow)
                     if m:
@@ -532,13 +566,12 @@ def telegram_polling():
                             tg_send(f"Índice fuera de rango (1–{len(URLS)}).{SIGN}", force=True)
                     else:
                         tg_send(f"Usá: /debug N (ej: /debug 2){SIGN}", force=True)
-
         except Exception as e:
             print("⚠️ Polling error:", e)
             time.sleep(5)
 
 # ==============================
-# Main loop
+# Loop principal
 # ==============================
 def run_monitor():
     tg_send(f"🔎 Radar levantado (URLs: {len(URLS)}){SIGN}", force=True)
@@ -567,7 +600,6 @@ def run_monitor():
                         if status == "AVAILABLE" and prev_status != "AVAILABLE":
                             head = title or "Show"
                             tg_send(f"✅ ¡Entradas disponibles!\n{head}\nFechas: {detail or '(sin fecha)'}\n{SIGN}")
-
                 except Exception as e:
                     ts = now_local().strftime("%Y-%m-%d %H:%M:%S")
                     LAST_RESULTS[url] = {"status": "UNKNOWN", "detail": str(e), "ts": ts, "title": LAST_RESULTS.get(url, {}).get("title")}
