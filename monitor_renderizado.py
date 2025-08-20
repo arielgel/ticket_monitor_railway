@@ -261,6 +261,93 @@ SCAN_ANYWHERE_SELECTORS = [
     "button", "a", "li", "div", "span", "[class*=date]", "[class*=fecha]", "[data-testid*=date]"
 ]
 
+# --- Zona de funciones (acotar el scraping al bloque correcto) ---
+def _find_functions_region(page):
+    """
+    Devuelve un locator de la 'zona de funciones':
+      1) contenedor del botón 'Ver entradas'
+      2) contenedor del texto 'Selecciona la función'
+      3) primer [role=listbox] visible
+    """
+    # 1) cerca de 'Ver entradas'
+    try:
+        btn = page.locator("button:has-text('Ver entradas'), a:has-text('Ver entradas')").first
+        if btn and btn.count() > 0:
+            # subimos algunos ancestros para agarrar el bloque
+            for lvl in range(1, 6):
+                ancestor = btn.locator(":scope >> xpath=ancestor::*[%d]" % lvl)
+                if ancestor and ancestor.count() > 0:
+                    return ancestor.first
+    except Exception:
+        pass
+
+    # 2) cerca del label 'Selecciona la función'
+    try:
+        lab = page.locator(":text('Selecciona la función')").first
+        if lab and lab.count() > 0:
+            for lvl in range(1, 6):
+                ancestor = lab.locator(":scope >> xpath=ancestor::*[%d]" % lvl)
+                if ancestor and ancestor.count() > 0:
+                    return ancestor.first
+    except Exception:
+        pass
+
+    # 3) primer listbox visible
+    try:
+        lb = page.locator("[role='listbox']").first
+        if lb and lb.count() > 0:
+            return lb
+    except Exception:
+        pass
+
+    return None
+
+def _gather_dates_in_region(region):
+    """
+    Extrae fechas SOLO dentro de la región dada (evita basura de otras partes).
+    Usa: listbox/select dentro de la región + texto del bloque.
+    """
+    if not region:
+        return []
+    texts = []
+    fechas = []
+    seen = set()
+
+    # 1) opciones (li[role=option], option, menu items) dentro de la región
+    try:
+        items = region.locator("[role='option'], li, .MuiMenuItem-root, option")
+        n = items.count()
+        for i in range(min(n, 150)):
+            it = items.nth(i)
+            try:
+                txt = (it.inner_text(timeout=250) or "").strip()
+            except Exception:
+                txt = ""
+            if not txt:
+                continue
+            if any(k in txt.lower() for k in ["agotado", "sold out", "sin disponibilidad", "sem disponibilidade"]):
+                continue
+            for f in extract_dates_only(txt):
+                if f not in seen:
+                    seen.add(f); fechas.append(f)
+    except Exception:
+        pass
+
+    # 2) texto bruto del bloque (por si las fechas no están segmentadas por items)
+    try:
+        raw = (region.inner_text(timeout=400) or "").strip()
+        if raw:
+            texts.append(raw)
+    except Exception:
+        pass
+    for t in texts:
+        for f in extract_dates_only(t):
+            if f not in seen:
+                seen.add(f); fechas.append(f)
+
+    return filter_and_sort_dates(fechas)
+
+
 # ==============================
 # Interacciones UI
 # ==============================
@@ -415,25 +502,37 @@ def check_url(url: str, page) -> tuple[list[str], str|None, str]:
         _select_preferred_market_if_present(page)
         _open_dropdown_if_any(page)
 
-        # Recolectar TODO en la página original
-        fechas = _gather_all_dates_on(page)
+        # 1) Buscar SOLO en la región de funciones de la página original
+        region = _find_functions_region(page)
+        fechas = _gather_dates_in_region(region)
 
-        # Si aún no hay fechas, intentar CTA (popup o inline) y repetir recolección
+        # 2) Si no hay, abrir CTA (popup o inline) y repetir en la región del destino
         if not fechas:
             dest = _click_cta_buy_get_page(page)
-            try: dest.wait_for_load_state("networkidle", timeout=6000)
-            except Exception: pass
-            # pequeño scroll por si hay lazy
+            try:
+                dest.wait_for_load_state("networkidle", timeout=6000)
+            except Exception:
+                pass
             try:
                 dest.mouse.wheel(0, 400); dest.wait_for_timeout(120)
                 dest.mouse.wheel(0, -400); dest.wait_for_timeout(120)
             except Exception:
                 pass
-            fechas = _gather_all_dates_on(dest)
 
-        # Fallback honesto: AVAILABLE sin fecha solo si nada de lo anterior devolvió fechas
+            region2 = _find_functions_region(dest)
+            fechas = _gather_dates_in_region(region2)
+
+        # 3) Último recurso: barridos previos (por si falló la región)
+        if not fechas:
+            # listbox/select + contenedores + full DOM (lo que ya tenías)
+            fechas = _gather_all_dates_on(page)
+            if not fechas and 'dest' in locals():
+                fechas = _gather_all_dates_on(dest)
+
+        # Fallback honesto solo si no hay fechas pero sí CTA/compra
         if not fechas and page_has_buy(page):
             status_hint = "AVAILABLE"
+
 
     except Exception as e:
         print(f"⚠️ Error al procesar {url}: {e}")
