@@ -66,9 +66,14 @@ def extract_title(page):
                 title = c
     except Exception:
         pass
-    # Limpiezas típicas
+    # Limpieza típica
     title = re.sub(r"\s+\|\s*All\s*Access.*$", "", title, flags=re.I)
     return title or None
+
+def prettify_from_slug(url: str) -> str:
+    """Fallback de nombre a partir del slug /event/<slug>."""
+    slug = url.rstrip("/").split("/")[-1]
+    return slug.replace("-", " ").title()
 
 def fmt_status_entry(url: str, info: dict, include_url: bool = True) -> str:
     title = info.get("title") or ""
@@ -98,13 +103,36 @@ def fmt_status_snapshot(snap: dict) -> str:
         lines.append("• " + fmt_status_entry(url, info, include_url=True))
     return "\n".join(lines)
 
+def quick_url_check(url: str) -> tuple[bool, str]:
+    """
+    Chequeo rápido HTTP para /shows:
+      True -> 2xx/3xx (probablemente válida)
+      False -> 4xx/5xx o error de red (inaccesible/typo)
+      dev: devuelve (ok, etiqueta_error_si_hay)
+    """
+    try:
+        r = requests.get(url, timeout=6, allow_redirects=True, headers={"User-Agent":"Mozilla/5.0"})
+        if 200 <= r.status_code < 400:
+            return True, ""
+        return False, f"ERROR HTTP {r.status_code}"
+    except Exception as e:
+        return False, f"ERROR {type(e).__name__}"
+
 def fmt_shows_indexed() -> str:
-    """Lista numerada (sin URLs). Usa el orden de URLS."""
+    """Lista numerada sin URLs; marca errores obvios de URL."""
     lines = [f"🎯 Monitoreando (N={len(URLS)}){SIGN}"]
+    if not URLS:
+        lines.append("(no hay URLs configuradas)")
+        return "\n".join(lines)
+
     for i, u in enumerate(URLS, start=1):
         title = (LAST_RESULTS.get(u) or {}).get("title")
-        label = title or f"Show {i}"
-        lines.append(f"{i}) {label}")
+        label = title or prettify_from_slug(u)
+        ok, err = quick_url_check(u)
+        if ok:
+            lines.append(f"{i}) {label}")
+        else:
+            lines.append(f"{i}) {label}  ❗ {err}")
     return "\n".join(lines)
 
 # ==============================
@@ -187,14 +215,12 @@ def telegram_polling():
                     tg_send(fmt_shows_indexed(), force=True)
 
                 elif tlow.startswith("/status"):
-                    # Intentar parsear índice: "/status 2"
                     m = re.match(r"^/status\s+(\d+)\s*$", tlow)
                     if m:
                         idx = int(m.group(1))
                         if 1 <= idx <= len(URLS):
                             url = URLS[idx - 1]
                             info = LAST_RESULTS.get(url, {"status": "UNKNOWN", "detail": None, "ts": "", "title": None})
-                            # Mostrar sin URL acá (pediste limpio), pero podrías añadirla si querés.
                             tg_send(fmt_status_entry(url, info, include_url=False) + f"\n{SIGN}", force=True)
                         else:
                             tg_send(f"Índice fuera de rango (1–{len(URLS)}).{SIGN}", force=True)
