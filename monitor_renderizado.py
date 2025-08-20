@@ -129,6 +129,78 @@ def fmt_shows_indexed() -> str:
         lines.append(f"{i}) {label}" + ("" if ok else f"  ❗ {err}"))
     return "\n".join(lines)
 
+def _collect_options_debug(page):
+    """Devuelve un dict con las opciones crudas encontradas en distintos selectores."""
+    buckets = {}
+    # Portal MUI
+    try:
+        items = page.locator(".MuiPopover-root [role='listbox'] li[role='option']")
+        if items and items.count() > 0:
+            buckets["portal_listbox"] = [ (items.nth(i).inner_text() or "").strip() for i in range(min(items.count(), 15)) ]
+    except Exception:
+        pass
+    # Listbox normal
+    try:
+        items = page.locator("[role='listbox'] li[role='option']")
+        if items and items.count() > 0:
+            buckets["dom_listbox"] = [ (items.nth(i).inner_text() or "").strip() for i in range(min(items.count(), 15)) ]
+    except Exception:
+        pass
+    # Select/option
+    try:
+        items = page.locator("select option")
+        if items and items.count() > 0:
+            buckets["select_option"] = [ (items.nth(i).inner_text() or "").strip() for i in range(min(items.count(), 15)) ]
+    except Exception:
+        pass
+    return buckets
+
+def debug_show_by_index(idx: int):
+    """Navega al show idx, intenta abrir selector, y envía dump por Telegram (force=True)."""
+    url = URLS[idx - 1]
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        try:
+            page.goto(url, timeout=60000)
+            page.wait_for_load_state("networkidle", timeout=15000)
+            title = extract_title(page) or prettify_from_slug(url)
+            # pistas globales
+            has_buy = page_has_buy(page)
+            has_sold = page_has_soldout(page)
+
+            _select_preferred_market_if_present(page)
+            _open_dropdown_if_any(page)
+            # pequeño scroll para provocar lazy render
+            try:
+                page.mouse.wheel(0, 500); page.wait_for_timeout(150)
+                page.mouse.wheel(0, -500); page.wait_for_timeout(150)
+            except Exception:
+                pass
+
+            buckets = _collect_options_debug(page)
+            # mensaje
+            parts = [
+                f"🧪 DEBUG — {title}",
+                f"URL idx {idx}",
+                f"buy_detected={has_buy}, soldout_detected={has_sold}",
+            ]
+            for k, vals in buckets.items():
+                if not vals: 
+                    continue
+                joined = "; ".join([v.replace("\n"," ").strip() for v in vals])
+                parts.append(f"{k}: {joined}")
+            if len(parts) == 3:
+                parts.append("no options found in known selectors")
+
+            tg_send("\n".join(parts) + f"\n{SIGN}", force=True)
+        except Exception as e:
+            tg_send(f"🧪 DEBUG ERROR idx {idx}: {e}\n{SIGN}", force=True)
+        finally:
+            try: browser.close()
+            except Exception: pass
+	
+	
 # ==============================
 # Heurísticas fecha vs. países
 # ==============================
@@ -384,6 +456,18 @@ def telegram_polling():
                     else:
                         snap = LAST_RESULTS.copy()
                         tg_send(fmt_status_snapshot(snap), force=True)
+                elif tlow.startswith("/debug"):
+                    m = re.match(r"^/debug\s+(\d+)\s*$", tlow)
+                    if m:
+                        idx = int(m.group(1))
+                        if 1 <= idx <= len(URLS):
+                            tg_send(f"⏳ Corriendo debug del show #{idx}…{SIGN}", force=True)
+                            # correr en hilo aparte para no bloquear el polling
+                            threading.Thread(target=debug_show_by_index, args=(idx,), daemon=True).start()
+                        else:
+                            tg_send(f"Índice fuera de rango (1–{len(URLS)}).{SIGN}", force=True)
+                    else:
+                        tg_send(f"Usá: /debug N (ej: /debug 2){SIGN}", force=True)
 
         except Exception as e:
             print("⚠️ Polling error:", e)
