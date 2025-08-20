@@ -60,6 +60,7 @@ def page_has_soldout(page) -> bool:
     return any(k in t for k in ["agotado", "sold out", "sin disponibilidad", "sem disponibilidade"])
 
 def page_has_buy(page) -> bool:
+    # Detector global (solo para debug). Para lógica de negocio usamos region_has_buy.
     t = page_text(page)
     return any(k in t for k in ["comprar", "comprar entradas", "buy tickets", "entradas"])
 
@@ -175,7 +176,7 @@ def _parse_date_str(s: str):
             return datetime(yy, mm, dd, tzinfo=ZoneInfo(TZ_NAME))
         except Exception:
             return None
-    return None  # descartamos dd/mm sin año
+    return None
 
 def filter_and_sort_dates(fecha_strs: list[str]) -> list[str]:
     """Solo fechas futuras y dentro de MAX_FUTURE_MONTHS. Orden ascendente."""
@@ -377,6 +378,22 @@ def _click_cta_buy_get_page(page):
             continue
     return page
 
+# --- NUEVO: buy solo dentro de la región ---
+def region_has_buy(region) -> bool:
+    """Detecta CTA de compra SOLO dentro de la región de funciones."""
+    if not region:
+        return False
+    try:
+        sel = (
+            "a:has-text('Comprar'), a:has-text('Comprar entradas'), "
+            "button:has-text('Comprar'), button:has-text('Comprar entradas'), "
+            "[data-testid*='comprar'], [data-testid*='buy'], [href*='comprar']"
+        )
+        btns = region.locator(sel)
+        return btns.count() > 0
+    except Exception:
+        return False
+
 # ==============================
 # Core: chequear una URL
 # ==============================
@@ -389,34 +406,36 @@ def check_url(url: str, page) -> tuple[list[str], str|None, str]:
 
         title = extract_title(page)
 
-        if page_has_buy(page):
-            status_hint = "AVAILABLE"
-        elif page_has_soldout(page):
-            status_hint = "SOLDOUT"
-
         _select_preferred_market_if_present(page)
         _open_dropdown_if_any(page)
 
-        # 1) SOLO región de funciones en la página original
+        # 1) Región de funciones en la página original
         region = _find_functions_region(page)
         fechas = _gather_dates_in_region(region)
 
-        # 2) Si no hay, abrir CTA (popup o inline) y repetir SOLO en la región del destino
-        if not fechas:
-            dest = _click_cta_buy_get_page(page)
-            try: dest.wait_for_load_state("networkidle", timeout=6000)
-            except Exception: pass
-            try:
-                dest.mouse.wheel(0, 400); dest.wait_for_timeout(120)
-                dest.mouse.wheel(0, -400); dest.wait_for_timeout(120)
-            except Exception:
-                pass
-            region2 = _find_functions_region(dest)
-            fechas = _gather_dates_in_region(region2)
+        soldout = page_has_soldout(page)
+        buy_in_region = region_has_buy(region)
 
-        # 3) Fallback honesto: si no hay fechas pero hay CTA/compra
-        if not fechas and page_has_buy(page):
-            status_hint = "AVAILABLE"
+        # 2) Si no hay fechas:
+        if not fechas:
+            if soldout:
+                status_hint = "SOLDOUT"   # prioridad al agotado
+            elif buy_in_region:
+                # Intentamos CTA SOLO si hay botón en la región
+                dest = _click_cta_buy_get_page(page)
+                try: dest.wait_for_load_state("networkidle", timeout=6000)
+                except Exception: pass
+                try:
+                    dest.mouse.wheel(0, 400); dest.wait_for_timeout(120)
+                    dest.mouse.wheel(0, -400); dest.wait_for_timeout(120)
+                except Exception:
+                    pass
+                region2 = _find_functions_region(dest)
+                fechas = _gather_dates_in_region(region2)
+                if not fechas:
+                    status_hint = "AVAILABLE"  # disponible pero sin fechas visibles
+            else:
+                status_hint = "UNKNOWN"
 
     except Exception as e:
         print(f"⚠️ Error al procesar {url}: {e}")
@@ -424,7 +443,7 @@ def check_url(url: str, page) -> tuple[list[str], str|None, str]:
     return fechas, title, status_hint
 
 # ==============================
-# DEBUG (solo región)
+# DEBUG (con hints)
 # ==============================
 def debug_show_by_index(idx: int):
     url = URLS[idx - 1]
@@ -435,13 +454,15 @@ def debug_show_by_index(idx: int):
             page.goto(url, timeout=60000)
             page.wait_for_load_state("networkidle", timeout=15000)
             title = extract_title(page) or prettify_from_slug(url)
-            has_buy = page_has_buy(page); has_sold = page_has_soldout(page)
+            has_buy_global = page_has_buy(page)
+            has_sold_global = page_has_soldout(page)
 
             _select_preferred_market_if_present(page)
             _open_dropdown_if_any(page)
 
             region = _find_functions_region(page)
             pre = _gather_dates_in_region(region)
+            buy_in_region = region_has_buy(region)
 
             dest = _click_cta_buy_get_page(page)
             try: dest.wait_for_load_state("networkidle", timeout=6000)
@@ -449,11 +470,16 @@ def debug_show_by_index(idx: int):
             region2 = _find_functions_region(dest)
             post = _gather_dates_in_region(region2)
 
+            decision_hint = ("SOLDOUT" if (has_sold_global and not pre)
+                             else ("AVAILABLE" if buy_in_region else "UNKNOWN"))
+
             parts = [
                 f"🧪 DEBUG — {title}",
                 f"URL idx {idx}",
-                f"buy_detected={has_buy}, soldout_detected={has_sold}",
+                f"buy_detected_global={has_buy_global}, soldout_detected_global={has_sold_global}",
+                f"buy_in_region={'yes' if buy_in_region else 'no'}",
                 f"popup_opened={'yes' if dest is not page else 'no'}",
+                f"decision_hint={decision_hint}",
                 "pre: " + (", ".join(pre) if pre else "-"),
                 "post: " + (", ".join(post) if post else "-"),
             ]
@@ -542,7 +568,7 @@ def run_monitor():
                             tg_send(f"✅ ¡Entradas disponibles!\n{head}\nFechas: {det}\n{SIGN}")
                         LAST_RESULTS[url] = {"status": "AVAILABLE", "detail": det, "ts": ts, "title": title}
                     else:
-                        status = "SOLDOUT" if (status_hint == "SOLDOUT" and not page_has_buy(page)) \
+                        status = "SOLDOUT" if status_hint == "SOLDOUT" \
                                  else ("AVAILABLE" if status_hint == "AVAILABLE" else "UNKNOWN")
                         detail = None
                         LAST_RESULTS[url] = {"status": status, "detail": detail, "ts": ts, "title": title}
