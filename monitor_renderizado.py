@@ -1,144 +1,226 @@
-import os, time, json, hashlib, requests, sys
-from datetime import datetime
+import os
+import time
+import json
+import requests
+from datetime import datetime, date
+from zoneinfo import ZoneInfo
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
+# ==================== Config ====================
 URL = os.getenv("URL", "https://www.allaccess.com.ar/event/airbag")
-CHECK_EVERY_SECONDS = int(os.getenv("CHECK_EVERY_SECONDS", "300"))  # 5 min
-RENDER_TIMEOUT_MS = int(os.getenv("RENDER_TIMEOUT_MS", "60000"))    # 60s
-STATE_FILE = "estado_render.json"
-
-AVAILABLE_KEYWORDS = (os.getenv("AVAILABLE_KEYWORDS") or "comprar,comprar entradas,buy tickets").lower().split(",")
-SOLDOUT_KEYWORDS   = (os.getenv("SOLDOUT_KEYWORDS")   or "agotado,sold out").lower().split(",")
-
-TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN")
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+CHECK_EVERY = int(os.getenv("CHECK_EVERY_SECONDS", "300"))
+TIMEOUT_MS = int(os.getenv("RENDER_TIMEOUT_MS", "60000"))
 
+# Silencio nocturno (configurable por env)
+TZ_NAME     = os.getenv("TIMEZONE", "America/Argentina/Buenos_Aires")
+QUIET_START = os.getenv("QUIET_START", "00:00")  # inclusive
+QUIET_END   = os.getenv("QUIET_END", "09:00")    # exclusivo
+
+STATE_FILE = "estado_monitor.json"
+
+AVAILABLE_KEYWORDS = ["comprar", "comprar entradas", "buy tickets"]
+SOLDOUT_KEYWORDS   = ["agotado", "sold out"]
+
+
+# ==================== Utiles horario ====================
+def parse_hhmm(s: str):
+    h, m = s.split(":")
+    return int(h), int(m)
+
+def now_local():
+    return datetime.now(ZoneInfo(TZ_NAME))
+
+def is_quiet_hours(moment: datetime) -> bool:
+    sh, sm = parse_hhmm(QUIET_START)
+    eh, em = parse_hhmm(QUIET_END)
+    local = moment
+    start = local.replace(hour=sh, minute=sm, second=0, microsecond=0)
+    end   = local.replace(hour=eh, minute=em, second=0, microsecond=0)
+    if start <= end:
+        return start <= local < end
+    else:
+        # rango que cruza medianoche (ej 22:00–07:00)
+        return local >= start or local < end
+
+def time_str(moment: datetime) -> str:
+    return moment.strftime("%Y-%m-%d %H:%M:%S")
+
+
+# ==================== Estado persistente ====================
+def load_state():
+    if not os.path.exists(STATE_FILE):
+        return {"last_status": None, "night_events": [], "last_summary_date": None}
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"last_status": None, "night_events": [], "last_summary_date": None}
+
+def save_state(state):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+# ==================== Notificaciones ====================
 def send_telegram(text: str):
     if not TOKEN or not CHAT_ID:
         print("⚠️ Falta TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID")
         return
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     try:
-        r = requests.post(url, data={"chat_id": CHAT_ID, "text": text}, timeout=20)
+        r = requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            data={"chat_id": CHAT_ID, "text": text},
+            timeout=20,
+        )
         r.raise_for_status()
     except Exception as e:
         print("❌ Error Telegram:", e)
 
-def load_state():
-    if not os.path.exists(STATE_FILE):
-        return {}
-    try:
-        return json.load(open(STATE_FILE, "r", encoding="utf-8"))
-    except Exception:
-        return {}
 
-def save_state(d):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
+def enqueue_night_event(state, moment: datetime, status: str, details: str):
+    state["night_events"].append({
+        "ts": time_str(moment),
+        "status": status,
+        "details": details
+    })
 
-def visible_text(page):
-    return page.evaluate("() => document.body.innerText").lower()
 
-def status_from_text(txt: str) -> str:
-    if any(k.strip() and k.strip() in txt for k in AVAILABLE_KEYWORDS):
-        return "AVAILABLE"
-    if any(k.strip() and k.strip() in txt for k in SOLDOUT_KEYWORDS):
-        return "SOLDOUT"
-    return "UNKNOWN"
+def maybe_flush_morning_summary(state, moment: datetime):
+    """Envía resumen a las 09:00 (o la hora QUIET_END) si hay eventos nocturnos y
+    aún no se envió resumen hoy."""
+    # Solo si YA no es horario silencioso
+    if is_quiet_hours(moment):
+        return state
 
-def fingerprint(txt: str) -> str:
-    return hashlib.sha256(txt.encode("utf-8")).hexdigest()
+    today_iso = moment.date().isoformat()
+    if state.get("last_summary_date") == today_iso:
+        return state
 
-def wait_full_render(page):
-    page.wait_for_load_state("domcontentloaded", timeout=RENDER_TIMEOUT_MS)
-    page.wait_for_load_state("networkidle", timeout=RENDER_TIMEOUT_MS)
-    page.wait_for_function("document.readyState === 'complete'", timeout=RENDER_TIMEOUT_MS)
-    page.evaluate("""() => new Promise(res => {
-        let y = 0;
-        const i = setInterval(() => {
-            window.scrollTo(0, y += 500);
-            if (y > document.body.scrollHeight + 800) { clearInterval(i); res(); }
-        }, 120);
-    })""")
-    page.wait_for_timeout(1200)
+    # Chequear si hoy ya pasamos QUIET_END
+    eh, em = parse_hhmm(QUIET_END)
+    cutoff = moment.replace(hour=eh, minute=em, second=0, microsecond=0)
+    if moment < cutoff:
+        return state  # todavía no llegamos al final del silencio
 
-def handle_interstitial(page):
-    txt = visible_text(page)
-    if "aguarde un instante" in txt or "actividad sospechosa" in txt:
-        page.wait_for_timeout(2500)
-        page.reload(wait_until="networkidle")
-        wait_full_render(page)
+    events = state.get("night_events", [])
+    if not events:
+        state["last_summary_date"] = today_iso
+        save_state(state)
+        return state
 
-def check_once(pw):
-    browser = pw.chromium.launch(headless=True, args=[
-        "--no-sandbox",
-        "--disable-blink-features=AutomationControlled",
-        "--disable-dev-shm-usage",
-    ])
-    ctx = browser.new_context(
-        user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"),
-        locale="es-AR",
-        timezone_id="America/Buenos_Aires",
-        viewport={"width": 1366, "height": 850},
-        has_touch=False,
-    )
-    page = ctx.new_page()
-    page.set_default_timeout(RENDER_TIMEOUT_MS)
+    # Construir resumen
+    lines = [f"🗞️ Resumen nocturno ({QUIET_START}–{QUIET_END} {TZ_NAME})", f"URL: {URL}", ""]
+    for e in events[-30:]:  # límite defensivo
+        lines.append(f"• {e['ts']}: {e['status']} — {e['details']}")
+    send_telegram("\n".join(lines))
 
-    try:
-        page.goto(URL, wait_until="networkidle", timeout=RENDER_TIMEOUT_MS)
-        wait_full_render(page)
-        handle_interstitial(page)
+    # Vaciar cola y marcar día
+    state["night_events"] = []
+    state["last_summary_date"] = today_iso
+    save_state(state)
+    return state
+
+
+# ==================== Scrape/render ====================
+def get_visible_status():
+    """Devuelve (status, detalles) tras renderizado real."""
+    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout  # import local
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=[
+            "--no-sandbox",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-dev-shm-usage",
+        ])
+        ctx = browser.new_context(
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Safari/537.36"),
+            locale="es-AR",
+            timezone_id=TZ_NAME,
+            viewport={"width": 1366, "height": 850},
+        )
+        page = ctx.new_page()
+        page.set_default_timeout(TIMEOUT_MS)
 
         try:
-            page.wait_for_selector("select, [role=combobox], button, a", timeout=2000)
-            page.wait_for_timeout(500)
+            page.goto(URL, wait_until="networkidle", timeout=TIMEOUT_MS)
+            # Esperas extra por si hay JS perezoso
+            page.wait_for_load_state("domcontentloaded")
+            page.wait_for_load_state("networkidle")
+            page.wait_for_function("document.readyState === 'complete'", timeout=TIMEOUT_MS)
+            page.evaluate("""() => new Promise(res => {
+                let y = 0;
+                const i = setInterval(() => {
+                    window.scrollTo(0, y += 500);
+                    if (y > document.body.scrollHeight + 800) { clearInterval(i); res(); }
+                }, 120);
+            })""")
+            page.wait_for_timeout(800)
+
+            txt = page.evaluate("() => document.body.innerText").lower()
+
+            # Intersticial anti-bot
+            if "aguarde un instante" in txt or "actividad sospechosa" in txt:
+                page.wait_for_timeout(2500)
+                page.reload(wait_until="networkidle")
+                txt = page.evaluate("() => document.body.innerText").lower()
+
+            # Evaluación por keywords
+            if any(k in txt for k in AVAILABLE_KEYWORDS):
+                return "AVAILABLE", "Detecté palabras de compra (p. ej. 'comprar')."
+            if any(k in txt for k in SOLDOUT_KEYWORDS):
+                return "SOLDOUT", "Sigue figurando 'agotado'."
+            return "UNKNOWN", "No encontré ni 'agotado' ni 'comprar'."
+
         except PWTimeout:
-            pass
+            return "UNKNOWN", "Timeout al cargar/renderizar."
+        except Exception as e:
+            return "UNKNOWN", f"Error: {e}"
+        finally:
+            ctx.close()
+            browser.close()
 
-        txt = visible_text(page)
-        st  = status_from_text(txt)
-        fp  = fingerprint(txt)
-        return st, fp
-    finally:
-        ctx.close()
-        browser.close()
 
-def main_loop():
-    state = load_state()
-    last_status = state.get("last_status")
-    last_fp = state.get("last_fp")
-
-    send_telegram(f"🔎 Monitor iniciado: {URL} (cada {CHECK_EVERY_SECONDS}s)")
-    print("🚀 Monitor corriendo. URL:", URL)
-
-    with sync_playwright() as pw:
-        while True:
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            try:
-                status, fp = check_once(pw)
-                print(f"[{ts}] status={status} fp={fp[:10]}...")
-                if status != last_status and status != "UNKNOWN":
-                    if status == "AVAILABLE":
-                        send_telegram(f"✅ ¡Detecté botón de compra/keywords en:\n{URL}")
-                    elif status == "SOLDOUT":
-                        send_telegram(f"⛔ Aún figura AGOTADO en:\n{URL}")
-                    last_status = status
-
-                if fp != last_fp:
-                    last_fp = fp
-                save_state({"last_status": last_status, "last_fp": last_fp})
-
-            except Exception as e:
-                print(f"[{ts}] 💥 Error:", e)
-
-            time.sleep(CHECK_EVERY_SECONDS)
-
+# ==================== Loop principal ====================
 if __name__ == "__main__":
-    try:
-        main_loop()
-    except KeyboardInterrupt:
-        print("🛑 Monitor detenido por el usuario")
-        sys.exit(0)
+    print(f"🔎 Monitor iniciado: {URL} (cada {CHECK_EVERY}s) | TZ={TZ_NAME} | silencio {QUIET_START}–{QUIET_END}")
+    state = load_state()
+    # Primer ping informativo (fuera de silencio)
+    now = now_local()
+    if not is_quiet_hours(now):
+        send_telegram(f"🔎 Monitor iniciado: {URL} (cada {CHECK_EVERY}s)")
+
+    while True:
+        try:
+            now = now_local()
+            # Si corresponde, manda resumen de lo que pasó en la noche
+            state = maybe_flush_morning_summary(state, now)
+
+            status, details = get_visible_status()
+            logline = f"[{time_str(now)}] status={status} | {details}"
+            print(logline)
+
+            last_status = state.get("last_status")
+
+            # Disparos según horario
+            if status != last_status and status != "UNKNOWN":
+                if is_quiet_hours(now):
+                    # Guardar para resumen
+                    enqueue_night_event(state, now, status, details)
+                else:
+                    # Aviso inmediato
+                    if status == "AVAILABLE":
+                        send_telegram(f"✅ ¡Entradas disponibles!\n{URL}\n{details}")
+                    elif status == "SOLDOUT":
+                        send_telegram(f"⛔ Aún figura AGOTADO.\n{URL}\n{details}")
+
+                state["last_status"] = status
+                save_state(state)
+
+        except Exception as e:
+            print(f"[{time_str(now_local())}] 💥 Error general: {e}")
+
+        time.sleep(CHECK_EVERY)
