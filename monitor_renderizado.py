@@ -15,8 +15,7 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # string
 URLS = [u.strip() for u in os.getenv("MONITORED_URLS", "").split(",") if u.strip()]
 CHECK_EVERY = int(os.getenv("CHECK_EVERY_SECONDS", "300"))  # segundos
 TZ_NAME = os.getenv("TIMEZONE", "America/Argentina/Buenos_Aires")
-PREFERRED_MARKET = os.getenv("PREFERRED_MARKET", "Argentina")  # para tabs/menús de país
-
+PREFERRED_MARKET = os.getenv("PREFERRED_MARKET", "Argentina")  # tabs/menús de país
 SIGN = " — Roberto"
 
 # ==============================
@@ -50,8 +49,22 @@ def tg_send(text: str, force: bool = False):
             print("❌ Error Telegram:", e)
     print(text)
 
+def page_text(page) -> str:
+    try:
+        return (page.evaluate("() => document.body.innerText") or "").lower()
+    except Exception:
+        return ""
+
+def page_has_soldout(page) -> bool:
+    t = page_text(page)
+    return any(k in t for k in ["agotado", "sold out", "sin disponibilidad", "sem disponibilidade"])
+
+def page_has_buy(page) -> bool:
+    t = page_text(page)
+    return any(k in t for k in ["comprar", "comprar entradas", "buy tickets", "entradas"])
+
 def extract_title(page):
-    """Obtiene un título amigable (title o og:title)."""
+    """Obtiene un título amigable (title u og:title) y limpia ' | All Access'."""
     title = ""
     try:
         title = (page.title() or "").strip()
@@ -117,19 +130,13 @@ def fmt_shows_indexed() -> str:
     return "\n".join(lines)
 
 # ==============================
-# Heurísticas fecha/hora vs. países
+# Heurísticas fecha vs. países
 # ==============================
-MESES_ES = ["enero","febrero","marzo","abril","mayo","junio","julio","agosto","septiembre","octubre","noviembre","diciembre"]
-DIAS_ES  = ["lunes","martes","miércoles","miercoles","jueves","viernes","sábado","sabado","domingo"]
 PAISES_COMUNES = {"argentina","brasil","colombia","chile","uruguay","perú","peru","paraguay","bolivia","mexico","méxico","portugal","españa","otros","other","latam"}
-
-# dd-mm(-yyyy) o dd/mm(/yyyy)
 RE_NUMERIC_DATE = re.compile(r"\b(\d{1,2})[-/](\d{1,2})(?:[-/](\d{2,4}))?\b")
-# dd de <mes> (de) yyyy | dd <mes> yyyy
-RE_MONTH_NAME   = re.compile(
-    r"\b(\d{1,2})\s+(?:de\s+)?(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)(?:\s+de)?\s+(\d{4})\b",
-    re.IGNORECASE
-)
+RE_MONTH_NAME   = re.compile(r"\b(\d{1,2})\s+(?:de\s+)?(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)(?:\s+de)?\s+(\d{4})\b", re.IGNORECASE)
+
+MESES_ES = ["enero","febrero","marzo","abril","mayo","junio","julio","agosto","septiembre","octubre","noviembre","diciembre"]
 
 def _month_to_num(m: str) -> int:
     m = m.strip().lower()
@@ -138,34 +145,19 @@ def _month_to_num(m: str) -> int:
     return 0
 
 def extract_dates_only(text: str) -> list[str]:
-    """
-    Extrae SOLO fechas (sin horas) del texto y las normaliza como dd/mm/yyyy o dd/mm.
-    Mantiene orden de aparición y deduplica.
-    """
-    out = []
-    seen = set()
-
-    # 1) Fechas numéricas
+    out, seen = [], set()
+    # 1) 14-11-2025 / 14/11/2025 / 14/11
     for d, m, y in RE_NUMERIC_DATE.findall(text):
-        dd = int(d); mm = int(m)
+        dd, mm = int(d), int(m)
         if not (1 <= dd <= 31 and 1 <= mm <= 12): continue
-        if y:
-            yy = int(y); yy = (2000 + yy) if len(y) == 2 else yy
-            s = f"{dd:02d}/{mm:02d}/{yy:04d}"
-        else:
-            s = f"{dd:02d}/{mm:02d}"
-        if s not in seen:
-            seen.add(s); out.append(s)
-
-    # 2) Fechas con nombre de mes
+        s = f"{dd:02d}/{mm:02d}/{int(y):04d}" if y else f"{dd:02d}/{mm:02d}"
+        if s not in seen: seen.add(s); out.append(s)
+    # 2) 14 de noviembre de 2025
     for d, mes, y in RE_MONTH_NAME.findall(text):
-        dd = int(d); mm = _month_to_num(mes)
+        dd, mm, yy = int(d), _month_to_num(mes), int(y)
         if not (1 <= dd <= 31 and 1 <= mm <= 12): continue
-        yy = int(y)
         s = f"{dd:02d}/{mm:02d}/{yy:04d}"
-        if s not in seen:
-            seen.add(s); out.append(s)
-
+        if s not in seen: seen.add(s); out.append(s)
     return out
 
 def _looks_like_country(s: str) -> bool:
@@ -173,27 +165,35 @@ def _looks_like_country(s: str) -> bool:
     return t in PAISES_COMUNES
 
 # ==============================
-# Dropdown/listbox (abrir y enumerar funciones)
+# Dropdown/listbox
 # ==============================
 FUNC_TRIGGERS = [
     "button[aria-haspopup='listbox']",
     "[role='combobox']",
     "[data-testid*='select']",
     ".MuiSelect-select",
-    ".aa-event-dates",
-    ".event-functions",
+    "button:has-text('Seleccionar')",
+    "button:has-text('Seleccioná')",
+    "button:has-text('Fecha')",
+    "button:has-text('Función')",
+]
+
+PORTAL_LISTBOX = [
+    ".MuiPopover-root .MuiMenu-list[role='listbox'] li[role='option']",
+    ".MuiPopover-root [role='listbox'] li[role='option']",
 ]
 
 LISTBOX_ROOTS = [
-    "[role='listbox']",       # PRIORIDAD: listbox Material UI
-    "select",                 # fallback
-    ".MuiList-root",
-    ".aa-event-dates",
-    ".event-functions",
+    "[role='listbox'] li[role='option']",  # PRIMERO: listbox MUI dentro del DOM normal
+    "select option",                        # fallback <select>
+    ".MuiList-root li[role='option']",
+    ".aa-event-dates [role='option']",
+    ".event-functions [role='option']",
 ]
 
 def _open_dropdown_if_any(page):
     """Intenta abrir el dropdown para que aparezcan opciones."""
+    # click en posibles triggers
     for trig in FUNC_TRIGGERS:
         try:
             loc = page.locator(trig).first
@@ -204,7 +204,7 @@ def _open_dropdown_if_any(page):
             continue
 
 def _select_preferred_market_if_present(page):
-    """Si hay tabs/lista de países, clickea el preferido (ej. Argentina) antes de enumerar funciones."""
+    """Si hay selector de países, clickea el preferido (ej. Argentina)."""
     target = (PREFERRED_MARKET or "").strip().lower()
     if not target: return
     candidates = [
@@ -212,7 +212,6 @@ def _select_preferred_market_if_present(page):
         ".tabs .tab",
         ".country-tabs *",
         "[data-testid*='country'] *",
-        "[role='listbox'] [role='option']",
         ".MuiTabs-root button, .MuiTab-root",
         ".filter-countries *"
     ]
@@ -237,15 +236,15 @@ def _select_preferred_market_if_present(page):
 
 def _list_functions_generic(page):
     """
-    Devuelve lista de (label, element, via) para funciones:
-      via='list'   si viene de listbox/listas (PRIORIDAD)
-      via='select' si viene de <select><option> (fallback)
+    Devuelve lista de (label, element, via):
+      via='portal' si viene de un Popover/Portal MUI
+      via='list'   si viene de listbox en DOM normal
+      via='select' si viene de <select><option>
     """
-    # 1) Listbox Material UI
+    # 0) Listbox en PORTAL (MuiPopover)
     try:
-        container = page.locator("[role='listbox']").first
-        if container and container.count() > 0:
-            items = container.locator("li[role='option']")
+        items = page.locator(", ".join(PORTAL_LISTBOX))
+        if items and items.count() > 0:
             out = []
             for i in range(min(items.count(), 120)):
                 it = items.nth(i)
@@ -253,47 +252,27 @@ def _list_functions_generic(page):
                     txt = (it.inner_text(timeout=250) or "").strip()
                 except Exception:
                     txt = ""
-                if not txt: continue
-                out.append((txt, it, "list"))
+                if txt:
+                    out.append((txt, it, "portal"))
             if out: return out
     except Exception:
         pass
 
-    # 2) <select><option>
-    try:
-        sel = page.locator("select").first
-        if sel and sel.count() > 0:
-            opts = sel.locator("option")
-            out = []
-            for i in range(opts.count()):
-                o = opts.nth(i)
-                try:
-                    lbl = (o.inner_text(timeout=200) or o.get_attribute("label") or "").strip()
-                except Exception:
-                    lbl = (o.get_attribute("label") or "").strip()
-                if lbl:
-                    out.append((lbl, o, "select"))
-            if out: return out
-    except Exception:
-        pass
-
-    # 3) Otros posibles contenedores (fallbacks suaves)
-    for root in (".MuiList-root", ".aa-event-dates", ".event-functions"):
+    # 1) Listbox en DOM normal
+    for sel in LISTBOX_ROOTS:
         try:
-            container = page.locator(root).first
-            if not container or container.count() == 0: continue
-            items = container.locator("[role='option'], li, .item, .option, a, button")
-            if items.count() == 0: continue
-            out = []
-            for i in range(min(items.count(), 120)):
-                it = items.nth(i)
-                try:
-                    txt = (it.inner_text(timeout=250) or "").strip()
-                except Exception:
-                    txt = ""
-                if not txt: continue
-                out.append((txt, it, "list"))
-            if out: return out
+            items = page.locator(sel)
+            if items and items.count() > 0:
+                out = []
+                for i in range(min(items.count(), 120)):
+                    it = items.nth(i)
+                    try:
+                        txt = (it.inner_text(timeout=250) or "").strip()
+                    except Exception:
+                        txt = ""
+                    if txt:
+                        out.append((txt, it, "list" if "option" in sel else "select"))
+                if out: return out
         except Exception:
             continue
 
@@ -302,16 +281,14 @@ def _list_functions_generic(page):
 # ==============================
 # Chequeo de una URL
 # ==============================
-def check_url(url: str, page) -> tuple[list[str], str|None]:
+def check_url(url: str, page) -> tuple[list[str], str|None, str]:
     """
-    Devuelve (lista_de_FECHAS_disponibles, titulo_del_show_o_None).
-    Soporta:
-      - listbox con <li role="option"> (prioridad)
-      - <select><option>
-      - show único (sin dropdown) -> intenta detectar compra (sin fecha)
+    Devuelve (fechas[], titulo, status_hint):
+      - fechas: lista de fechas normalizadas dd/mm(/yyyy)
+      - status_hint: 'AVAILABLE' si detecta compra explícitamente, 'SOLDOUT' si detecta Agotado explícito, 'UNKNOWN' si no
     """
-    fechas = []
-    title = None
+    fechas, title = [], None
+    status_hint = "UNKNOWN"
 
     try:
         page.goto(url, timeout=60000)
@@ -320,7 +297,13 @@ def check_url(url: str, page) -> tuple[list[str], str|None]:
         # Título
         title = extract_title(page)
 
-        # Preferir mercado (ej. Argentina) si hubiera selector de países
+        # pistas globales
+        if page_has_buy(page):
+            status_hint = "AVAILABLE"
+        elif page_has_soldout(page):
+            status_hint = "SOLDOUT"
+
+        # País preferido
         _select_preferred_market_if_present(page)
 
         # Abrir dropdown y enumerar opciones
@@ -338,27 +321,21 @@ def check_url(url: str, page) -> tuple[list[str], str|None]:
                     continue
                 if is_soldout_label(lbl):
                     continue
-                # EXTRAER SOLO FECHAS
                 found = extract_dates_only(lbl)
                 for f in found:
                     if f not in fechas:
                         fechas.append(f)
+
         else:
-            # No hay dropdown: show único → buscar botón compra (sin fecha)
-            try:
-                for btn in page.query_selector_all("button, a")[:120]:
-                    t = (btn.inner_text() or "").lower()
-                    if any(k in t for k in ["comprar", "entradas", "buy"]):
-                        if "(sin fecha)" not in fechas:
-                            fechas.append("(sin fecha)")
-                        break
-            except Exception:
-                pass
+            # Fallback show único: botón compra (sin fecha)
+            if page_has_buy(page) and "(sin fecha)" not in fechas:
+                fechas.append("(sin fecha)")
+                status_hint = "AVAILABLE"
 
     except Exception as e:
         print(f"⚠️ Error al procesar {url}: {e}")
 
-    return fechas, title
+    return fechas, title, status_hint
 
 # ==============================
 # Telegram polling (/status [n], /shows)
@@ -425,12 +402,12 @@ def run_monitor():
         while True:
             for url in URLS:
                 try:
-                    fechas, title = check_url(url, page)
+                    fechas, title, status_hint = check_url(url, page)
                     ts = now_local().strftime("%Y-%m-%d %H:%M:%S")
 
                     prev_status = LAST_RESULTS.get(url, {}).get("status", "UNKNOWN")
+
                     if fechas:
-                        # Armar string de fechas (sin horas)
                         det = ", ".join(fechas)
                         if prev_status != "AVAILABLE":
                             head = title or "Show"
@@ -442,13 +419,17 @@ def run_monitor():
                             "title": title
                         }
                     else:
+                        # Si no levantamos fechas:
+                        # - Si hay 'Agotado' explícito y NO hay 'Comprar' → SOLDOUT
+                        # - En cualquier otra duda → UNKNOWN (no te miento)
+                        status = "SOLDOUT" if (status_hint == "SOLDOUT" and not page_has_buy(page)) else "UNKNOWN"
                         LAST_RESULTS[url] = {
-                            "status": "SOLDOUT",
+                            "status": status,
                             "detail": None,
                             "ts": ts,
                             "title": title
                         }
-                        print(f"❌ Nada en {title or url} — {ts}")
+                        print(f"{'⛔' if status=='SOLDOUT' else '❓'} {title or url} — {ts}")
 
                 except Exception as e:
                     ts = now_local().strftime("%Y-%m-%d %H:%M:%S")
