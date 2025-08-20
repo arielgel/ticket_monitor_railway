@@ -129,7 +129,7 @@ def fmt_shows_indexed() -> str:
     return "\n".join(lines)
 
 # ==============================
-# Fechas / países
+# Fechas
 # ==============================
 PAISES_COMUNES = {"argentina","brasil","colombia","chile","uruguay","perú","peru","paraguay","bolivia","mexico","méxico","portugal","españa","otros","other","latam"}
 
@@ -167,10 +167,6 @@ def extract_dates_only(text: str) -> list[str]:
         if s not in seen: seen.add(s); out.append(s)
     return out
 
-def _looks_like_country(s: str) -> bool:
-    t = s.strip().lower().replace("ó","o")
-    return t in PAISES_COMUNES
-
 def _parse_date_str(s: str):
     parts = s.split("/")
     if len(parts) == 3:
@@ -182,6 +178,7 @@ def _parse_date_str(s: str):
     return None  # descartamos dd/mm sin año
 
 def filter_and_sort_dates(fecha_strs: list[str]) -> list[str]:
+    """Solo fechas futuras y dentro de MAX_FUTURE_MONTHS. Orden ascendente."""
     out = []
     now = now_local()
     horizon = now + timedelta(days=MAX_FUTURE_MONTHS*30)
@@ -201,7 +198,7 @@ def filter_and_sort_dates(fecha_strs: list[str]) -> list[str]:
     return [d.strftime("%d/%m/%Y") for d in out]
 
 # ==============================
-# Selectores UI
+# Selectores / UI
 # ==============================
 FUNC_TRIGGERS = [
     "button[aria-haspopup='listbox']",
@@ -229,127 +226,93 @@ CTA_BUY_SELECTORS = [
     "[data-testid*='buy']",
     "[href*='comprar']",
 ]
-CONTAINERS_PRIORITARIOS = [
-    "[role='dialog']",
-    ".MuiDialog-root",
-    ".MuiDialog-container",
-    ".MuiDrawer-root",
-    ".MuiPaper-root.MuiDialog-paper",
-    ".MuiPopover-root",
-    ".MuiMenu-paper",
-    ".aa-event-dates",
-    ".event-functions",
-    "[role='listbox']",
-]
-PORTAL_SELECTORS = [
-    ".MuiPopover-root .MuiMenu-list[role='listbox'] li[role='option']",
-    ".MuiPopover-root [role='listbox'] li[role='option']",
-    ".MuiMenu-paper [role='listbox'] li[role='option']",
-    ".MuiPaper-root [role='listbox'] li[role='option']",
-    ".MuiPopover-root li.MuiMenuItem-root",
-    ".MuiMenu-paper li.MuiMenuItem-root",
-]
-LISTBOX_SELECTORS = [
-    "[role='listbox'] li[role='option']",
-    "select option",
-    ".MuiList-root li[role='option']",
-    ".aa-event-dates [role='option']",
-    ".event-functions [role='option']",
-    ".MuiList-root li.MuiMenuItem-root",
-]
-SCAN_ANYWHERE_SELECTORS = [
-    "button", "a", "li", "div", "span", "[class*=date]", "[class*=fecha]", "[data-testid*=date]"
-]
 
-# --- Zona de funciones (acotar el scraping al bloque correcto) ---
+# ==============================
+# Región de funciones (recorte)
+# ==============================
+def _nearest_block(locator, max_up=6):
+    """Sube por ancestros y devuelve el bloque contenedor real."""
+    for lvl in range(1, max_up + 1):
+        try:
+            anc = locator.locator(f":scope >> xpath=ancestor::*[{lvl}]")
+            if anc and anc.count() > 0:
+                try:
+                    bb = anc.bounding_box()
+                    txt = (anc.inner_text(timeout=250) or "").strip()
+                except Exception:
+                    bb, txt = None, ""
+                if bb and len(txt) > 10:
+                    return anc.first
+        except Exception:
+            continue
+    return locator if locator and locator.count() > 0 else None
+
 def _find_functions_region(page):
     """
-    Devuelve un locator de la 'zona de funciones':
-      1) contenedor del botón 'Ver entradas'
-      2) contenedor del texto 'Selecciona la función'
+    Devuelve SOLO la región del selector de funciones.
+    Prioridad:
+      1) bloque del texto 'Selecciona la función'
+      2) bloque del botón 'Ver entradas'
       3) primer [role=listbox] visible
     """
-    # 1) cerca de 'Ver entradas'
+    try:
+        lab = page.locator("text=Selecciona la función").first
+        if lab and lab.count() > 0:
+            return _nearest_block(lab)
+    except Exception:
+        pass
     try:
         btn = page.locator("button:has-text('Ver entradas'), a:has-text('Ver entradas')").first
         if btn and btn.count() > 0:
-            # subimos algunos ancestros para agarrar el bloque
-            for lvl in range(1, 6):
-                ancestor = btn.locator(":scope >> xpath=ancestor::*[%d]" % lvl)
-                if ancestor and ancestor.count() > 0:
-                    return ancestor.first
+            return _nearest_block(btn)
     except Exception:
         pass
-
-    # 2) cerca del label 'Selecciona la función'
-    try:
-        lab = page.locator(":text('Selecciona la función')").first
-        if lab and lab.count() > 0:
-            for lvl in range(1, 6):
-                ancestor = lab.locator(":scope >> xpath=ancestor::*[%d]" % lvl)
-                if ancestor and ancestor.count() > 0:
-                    return ancestor.first
-    except Exception:
-        pass
-
-    # 3) primer listbox visible
     try:
         lb = page.locator("[role='listbox']").first
         if lb and lb.count() > 0:
-            return lb
+            return _nearest_block(lb)
     except Exception:
         pass
-
     return None
 
 def _gather_dates_in_region(region):
     """
-    Extrae fechas SOLO dentro de la región dada (evita basura de otras partes).
-    Usa: listbox/select dentro de la región + texto del bloque.
+    Extrae fechas SOLO dentro de 'region'.
+    No mira el resto de la página (evita basura de banners/footer).
     """
     if not region:
         return []
-    texts = []
-    fechas = []
-    seen = set()
-
-    # 1) opciones (li[role=option], option, menu items) dentro de la región
+    fechas, seen = [], set()
+    # 1) items tipo opción dentro de region
     try:
-        items = region.locator("[role='option'], li, .MuiMenuItem-root, option")
-        n = items.count()
-        for i in range(min(n, 150)):
+        items = region.locator("[role='option'], option, .MuiMenuItem-root, li, a, button, div")
+        n = min(items.count(), 200)
+        for i in range(n):
             it = items.nth(i)
             try:
                 txt = (it.inner_text(timeout=250) or "").strip()
             except Exception:
                 txt = ""
-            if not txt:
-                continue
-            if any(k in txt.lower() for k in ["agotado", "sold out", "sin disponibilidad", "sem disponibilidade"]):
+            low = txt.lower()
+            if not txt or "agotado" in low or "sold out" in low or "sin disponibilidad" in low:
                 continue
             for f in extract_dates_only(txt):
                 if f not in seen:
                     seen.add(f); fechas.append(f)
     except Exception:
         pass
-
-    # 2) texto bruto del bloque (por si las fechas no están segmentadas por items)
+    # 2) respaldo: texto bruto del bloque
     try:
         raw = (region.inner_text(timeout=400) or "").strip()
-        if raw:
-            texts.append(raw)
-    except Exception:
-        pass
-    for t in texts:
-        for f in extract_dates_only(t):
+        for f in extract_dates_only(raw):
             if f not in seen:
                 seen.add(f); fechas.append(f)
-
+    except Exception:
+        pass
     return filter_and_sort_dates(fechas)
 
-
 # ==============================
-# Interacciones UI
+# Interacciones
 # ==============================
 def _open_dropdown_if_any(page):
     for trig in FUNC_TRIGGERS:
@@ -392,56 +355,6 @@ def _select_preferred_market_if_present(page):
         except Exception:
             continue
 
-def _collect_options_from(page, selectors) -> list[str]:
-    out = []
-    try:
-        items = page.locator(", ".join(selectors))
-        if items and items.count() > 0:
-            for i in range(min(items.count(), 200)):
-                it = items.nth(i)
-                try: txt = (it.inner_text(timeout=250) or "").strip()
-                except Exception: txt = ""
-                if txt: out.append(txt)
-    except Exception:
-        pass
-    return out
-
-def _list_functions_generic(page) -> list[str]:
-    for selectors in (PORTAL_SELECTORS, LISTBOX_SELECTORS):
-        labels = _collect_options_from(page, selectors)
-        if labels:
-            return labels
-    return []
-
-def _scan_dates_in_priority_containers(page) -> list[str]:
-    textos = []
-    for sel in CONTAINERS_PRIORITARIOS:
-        try:
-            nodes = page.locator(sel); n = nodes.count()
-            for i in range(min(n, 8)):
-                node = nodes.nth(i)
-                try: txt = (node.inner_text(timeout=300) or "").strip()
-                except Exception: txt = ""
-                if txt: textos.append(txt)
-        except Exception:
-            continue
-    fechas, seen = [], set()
-    for t in textos:
-        for f in extract_dates_only(t):
-            if f not in seen: seen.add(f); fechas.append(f)
-    return fechas
-
-def _scan_dates_anywhere(page) -> list[str]:
-    labels = _collect_options_from(page, SCAN_ANYWHERE_SELECTORS)
-    fechas, seen = [], set()
-    for lbl in labels:
-        if _looks_like_country(lbl): 
-            continue
-        for f in extract_dates_only(lbl):
-            if f not in seen:
-                seen.add(f); fechas.append(f)
-    return fechas
-
 def _click_cta_buy_get_page(page):
     # si abre popup, seguimos ahí; si no, misma page
     for sel in CTA_BUY_SELECTORS:
@@ -464,24 +377,6 @@ def _click_cta_buy_get_page(page):
             continue
     return page
 
-def _gather_all_dates_on(page) -> list[str]:
-    """
-    Junta fechas de: listbox/select + contenedores prioritarios + escaneo total.
-    """
-    dates = []
-    # 1) listbox/select
-    for lbl in _list_functions_generic(page):
-        if not lbl: continue
-        if _looks_like_country(lbl): continue
-        if any(k in lbl.lower() for k in ["agotado","sold out","sin disponibilidad","sem disponibilidade"]): continue
-        dates.extend(extract_dates_only(lbl))
-    # 2) contenedores del flujo
-    dates.extend(_scan_dates_in_priority_containers(page))
-    # 3) barrido general
-    dates.extend(_scan_dates_anywhere(page))
-    # limpiar, ordenar, filtrar
-    return filter_and_sort_dates(dates)
-
 # ==============================
 # Core: chequear una URL
 # ==============================
@@ -502,37 +397,26 @@ def check_url(url: str, page) -> tuple[list[str], str|None, str]:
         _select_preferred_market_if_present(page)
         _open_dropdown_if_any(page)
 
-        # 1) Buscar SOLO en la región de funciones de la página original
+        # 1) SOLO región de funciones en la página original
         region = _find_functions_region(page)
         fechas = _gather_dates_in_region(region)
 
-        # 2) Si no hay, abrir CTA (popup o inline) y repetir en la región del destino
+        # 2) Si no hay, abrir CTA (popup o inline) y repetir SOLO en la región del destino
         if not fechas:
             dest = _click_cta_buy_get_page(page)
-            try:
-                dest.wait_for_load_state("networkidle", timeout=6000)
-            except Exception:
-                pass
+            try: dest.wait_for_load_state("networkidle", timeout=6000)
+            except Exception: pass
             try:
                 dest.mouse.wheel(0, 400); dest.wait_for_timeout(120)
                 dest.mouse.wheel(0, -400); dest.wait_for_timeout(120)
             except Exception:
                 pass
-
             region2 = _find_functions_region(dest)
             fechas = _gather_dates_in_region(region2)
 
-        # 3) Último recurso: barridos previos (por si falló la región)
-        if not fechas:
-            # listbox/select + contenedores + full DOM (lo que ya tenías)
-            fechas = _gather_all_dates_on(page)
-            if not fechas and 'dest' in locals():
-                fechas = _gather_all_dates_on(dest)
-
-        # Fallback honesto solo si no hay fechas pero sí CTA/compra
+        # 3) Fallback honesto: si no hay fechas pero hay CTA/compra
         if not fechas and page_has_buy(page):
             status_hint = "AVAILABLE"
-
 
     except Exception as e:
         print(f"⚠️ Error al procesar {url}: {e}")
@@ -540,7 +424,7 @@ def check_url(url: str, page) -> tuple[list[str], str|None, str]:
     return fechas, title, status_hint
 
 # ==============================
-# DEBUG opcional
+# DEBUG (solo región)
 # ==============================
 def debug_show_by_index(idx: int):
     url = URLS[idx - 1]
@@ -556,12 +440,14 @@ def debug_show_by_index(idx: int):
             _select_preferred_market_if_present(page)
             _open_dropdown_if_any(page)
 
-            pre = _gather_all_dates_on(page)
+            region = _find_functions_region(page)
+            pre = _gather_dates_in_region(region)
 
             dest = _click_cta_buy_get_page(page)
             try: dest.wait_for_load_state("networkidle", timeout=6000)
             except Exception: pass
-            post = _gather_all_dates_on(dest)
+            region2 = _find_functions_region(dest)
+            post = _gather_dates_in_region(region2)
 
             parts = [
                 f"🧪 DEBUG — {title}",
@@ -658,7 +544,7 @@ def run_monitor():
                     else:
                         status = "SOLDOUT" if (status_hint == "SOLDOUT" and not page_has_buy(page)) \
                                  else ("AVAILABLE" if status_hint == "AVAILABLE" else "UNKNOWN")
-                        detail = None  # ya no mandamos "(sin fecha)" al snapshot; solo alertamos transición
+                        detail = None
                         LAST_RESULTS[url] = {"status": status, "detail": detail, "ts": ts, "title": title}
                         print(f"{'⛔' if status=='SOLDOUT' else ('✅' if status=='AVAILABLE' else '❓')} {title or url} — {ts}")
                         if status == "AVAILABLE" and prev_status != "AVAILABLE":
