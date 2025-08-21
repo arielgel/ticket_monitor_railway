@@ -3,12 +3,30 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from playwright.sync_api import sync_playwright
 
-# --- Config ---
-BOT_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
-CHAT_ID     = os.getenv("TELEGRAM_CHAT_ID", "")
-URLS        = os.getenv("URLS", "").split(";") if os.getenv("URLS") else []
-TZ_NAME     = "America/Argentina/Buenos_Aires"
-CHECK_EVERY = int(os.getenv("CHECK_EVERY_SECONDS", "300"))
+# ==============================
+# Config (retro-compatible con tus envs de Railway)
+# ==============================
+def _get_env_any(*names, default=""):
+    for n in names:
+        v = os.getenv(n)
+        if v:
+            return v
+    return default
+
+BOT_TOKEN   = _get_env_any("TELEGRAM_BOT_TOKEN", "BOT_TOKEN", default="")
+CHAT_ID     = _get_env_any("TELEGRAM_CHAT_ID", "CHAT_ID", default="")
+
+# URLs: acepta URLS, MONITORED_URLS o URL. Soporta ; o , como separador.
+URLS_RAW    = _get_env_any("URLS", "MONITORED_URLS", "URL", default="")
+_raw = URLS_RAW.replace(";", ",")
+URLS = [u.strip() for u in _raw.split(",") if u.strip()]
+
+# Intervalo de chequeo (segundos)
+CHECK_EVERY = int(_get_env_any("CHECK_EVERY_SECONDS", "CHECK_EVERY", default="300"))
+
+# Zona horaria
+TZ_NAME     = _get_env_any("TIMEZONE", "TZ", "TZ_NAME", default="America/Argentina/Buenos_Aires")
+
 
 # --- Utilidades ---
 def now_local():
