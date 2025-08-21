@@ -806,42 +806,58 @@ def debug_show_by_index(idx: int):
 # ==============================
 def telegram_polling():
     if not (BOT_TOKEN and CHAT_ID):
-        print("ℹ️ Telegram polling desactivado (faltan credenciales)."); return
+        print("ℹ️ Telegram polling desactivado (faltan credenciales).")
+        return
+
     offset = None
     api = f"https://api.telegram.org/bot{BOT_TOKEN}"
     print("🛰️ Telegram polling iniciado.")
+
     while True:
         try:
             params = {"timeout": 50}
-            if offset is not None: params["offset"] = offset
+            if offset is not None:
+                params["offset"] = offset
+
             r = requests.get(f"{api}/getUpdates", params=params, timeout=60)
             r.raise_for_status()
             data = r.json()
             if not data.get("ok"):
-                time.sleep(3); continue
+                time.sleep(3)
+                continue
+
             for upd in data.get("result", []):
                 offset = upd["update_id"] + 1
+
                 msg = upd.get("message") or {}
                 chat = msg.get("chat", {})
                 text = (msg.get("text") or "").strip()
                 chat_id = str(chat.get("id") or "")
-                if not text or chat_id != str(CHAT_ID): continue
+                if not text or chat_id != str(CHAT_ID):
+                    continue
+
                 tlow = text.lower()
+
                 if tlow.startswith("/shows"):
                     tg_send(fmt_shows_indexed(), force=True)
+
                 elif tlow.startswith("/status"):
                     m = re.match(r"^/status\s+(\d+)\s*$", tlow)
                     if m:
                         idx = int(m.group(1))
                         if 1 <= idx <= len(URLS):
                             url = URLS[idx - 1]
-                            info = LAST_RESULTS.get(url, {"status": "UNKNOWN", "detail": None, "ts": "", "title": None})
+                            info = LAST_RESULTS.get(
+                                url,
+                                {"status": "UNKNOWN", "detail": None, "ts": "", "title": None},
+                            )
                             tg_send(fmt_status_entry(url, info, include_url=False) + f"\n{SIGN}", force=True)
                         else:
                             tg_send(f"Índice fuera de rango (1–{len(URLS)}).{SIGN}", force=True)
                     else:
                         snap = LAST_RESULTS.copy()
                         tg_send(fmt_status_snapshot(snap), force=True)
+
                 elif tlow.startswith("/debug"):
                     m = re.match(r"^/debug\s+(\d+)\s*$", tlow)
                     if m:
@@ -853,13 +869,18 @@ def telegram_polling():
                             tg_send(f"Índice fuera de rango (1–{len(URLS)}).{SIGN}", force=True)
                     else:
                         tg_send(f"Usá: /debug N (ej: /debug 2){SIGN}", force=True)
-				elif tlow.startswith("/sectores"):
+
+                elif tlow.startswith("/sectores"):
                     m = re.match(r"^/sectores\s+(\d+)\s*$", tlow)
                     if m:
                         idx = int(m.group(1))
                         if 1 <= idx <= len(URLS):
                             tg_send(f"⏳ Buscando sectores por fecha del show #{idx}…{SIGN}", force=True)
-                            threading.Thread(target=cmd_list_sectors_for_show_index, args=(idx,), daemon=True).start()
+                            threading.Thread(
+                                target=cmd_list_sectors_for_show_index,
+                                args=(idx,),
+                                daemon=True
+                            ).start()
                         else:
                             tg_send(f"Índice fuera de rango (1–{len(URLS)}).{SIGN}", force=True)
                     else:
