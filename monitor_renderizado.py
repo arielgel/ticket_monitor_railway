@@ -4,7 +4,7 @@ import time
 import threading
 import traceback
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 from playwright.sync_api import sync_playwright
 
@@ -18,45 +18,42 @@ def _get_env_any(*names, default=""):
             return v
     return default
 
-BOT_TOKEN   = _get_env_any("TELEGRAM_BOT_TOKEN", "BOT_TOKEN", default="")
-CHAT_ID     = _get_env_any("TELEGRAM_CHAT_ID", "CHAT_ID", default="")
+BOT_TOKEN = _get_env_any("TELEGRAM_BOT_TOKEN", "BOT_TOKEN", default="")
+CHAT_ID = _get_env_any("TELEGRAM_CHAT_ID", "CHAT_ID", default="")
 
 # URLs: acepta URLS, MONITORED_URLS o URL. Soporta ; o , como separador.
-URLS_RAW    = _get_env_any("URLS", "MONITORED_URLS", "URL", default="")
-_raw = URLS_RAW.replace(";", ",")
-URLS = [u.strip() for u in _raw.split(",") if u.strip()]
+URLS_RAW = _get_env_any("URLS", "MONITORED_URLS", "URL", default="")
+_urls_norm = URLS_RAW.replace(";", ",")
+URLS = [u.strip() for u in _urls_norm.split(",") if u.strip()]
 
 CHECK_EVERY = int(_get_env_any("CHECK_EVERY_SECONDS", "CHECK_EVERY", default="300"))
-TZ_NAME     = _get_env_any("TIMEZONE", "TZ", "TZ_NAME", default="America/Argentina/Buenos_Aires")
-
-# silencio nocturno opcional (0–9 por defecto). Cambiar con QUIET_START/QUIET_END (hora 0-23)
+TZ_NAME = _get_env_any("TIMEZONE", "TZ", "TZ_NAME", default="America/Argentina/Buenos_Aires")
 QUIET_START = int(_get_env_any("QUIET_START", default="0"))
-QUIET_END   = int(_get_env_any("QUIET_END",   default="9"))
+QUIET_END = int(_get_env_any("QUIET_END", default="9"))
 
 SIGN = " — Roberto"
 
 # ==============================
-# Estado
+# Estado en memoria
 # ==============================
 LAST_RESULTS = {u: {"status": "UNKNOWN", "detail": None, "ts": "", "title": None} for u in URLS}
 
 # ==============================
 # Utilitarios
 # ==============================
-def now_local():
+def now_local() -> datetime:
     return datetime.now(ZoneInfo(TZ_NAME))
 
-def within_quiet_hours():
+def within_quiet_hours() -> bool:
     h = now_local().hour
-    # rango [QUIET_START, QUIET_END)
     if QUIET_START <= QUIET_END:
         return QUIET_START <= h < QUIET_END
-    # rango que cruza medianoche (ej 22–7)
     return h >= QUIET_START or h < QUIET_END
 
 def tg_send(text: str, force: bool = False):
     if not force and within_quiet_hours():
-        print("⏸️ Silenciado:", text); return
+        print("⏸️ Silenciado:", text)
+        return
     if BOT_TOKEN and CHAT_ID:
         try:
             requests.post(
@@ -73,7 +70,7 @@ def prettify_from_slug(url: str) -> str:
     return slug.replace("-", " ").title()
 
 # ==============================
-# Extracción de título
+# Título y detectores
 # ==============================
 def extract_title(page):
     title = ""
@@ -81,29 +78,28 @@ def extract_title(page):
         og = page.locator('meta[property="og:title"]').first
         if og and og.count() > 0:
             c = (og.get_attribute("content") or "").strip()
-            if c: title = c
+            if c:
+                title = c
     except Exception:
         pass
-    try:
-        if not title:
+    if not title:
+        try:
             title = (page.title() or "").strip()
-    except Exception:
-        pass
+        except Exception:
+            pass
     if not title:
         for sel in ["h1", ".event-title", "[data-testid='event-title']", "header h1"]:
             try:
                 h = page.locator(sel).first
                 if h and h.count() > 0:
                     title = (h.inner_text() or "").strip()
-                    if title: break
+                    if title:
+                        break
             except Exception:
                 continue
     title = re.sub(r"\s*\|\s*All\s*Access.*$", "", title, flags=re.I)
     return title or None
 
-# ==============================
-# Detectores globales simples
-# ==============================
 def page_text(page) -> str:
     try:
         return (page.evaluate("() => document.body.innerText") or "").lower()
@@ -205,7 +201,8 @@ def _gather_dates_in_region(region):
                 continue
             for d in RE_DATE.findall(txt):
                 if d not in seen:
-                    seen.add(d); fechas.append(d)
+                    seen.add(d)
+                    fechas.append(d)
     except Exception:
         pass
 
@@ -213,16 +210,16 @@ def _gather_dates_in_region(region):
         raw = (region.inner_text(timeout=400) or "").strip()
         for d in RE_DATE.findall(raw):
             if d not in seen:
-                seen.add(d); fechas.append(d)
+                seen.add(d)
+                fechas.append(d)
     except Exception:
         pass
 
-    # únicas y orden dd/mm/yyyy
     fechas = sorted(set(fechas), key=lambda s: (s[-4:], s[3:5], s[0:2]))
     return fechas
 
 # ==============================
-# Chequeo principal de una URL
+# Chequeo de una URL
 # ==============================
 def check_url(url: str, page):
     fechas, title = [], None
@@ -263,13 +260,16 @@ def fmt_status_entry(url: str, info: dict, include_url: bool = False) -> str:
 
     if st.startswith("AVAILABLE"):
         line = f"✅ <b>¡Entradas disponibles!</b>\n{head}"
-        if det: line += f"\nFechas: {det}"
+        if det:
+            line += f"\nFechas: {det}"
     elif st == "SOLDOUT":
         line = f"⛔ Agotado — {head}"
     else:
         line = f"❓ Indeterminado — {head}"
-        if det: line += f"\nNota: {det}"
-    if ts: line += f"\nÚltimo check: {ts}"
+        if det:
+            line += f"\nNota: {det}"
+    if ts:
+        line += f"\nÚltimo check: {ts}"
     return line
 
 def fmt_shows_indexed() -> str:
@@ -281,22 +281,29 @@ def fmt_shows_indexed() -> str:
     return "\n".join(lines) + f"\n{SIGN}"
 
 # ==============================
-# Telegram polling (comandos)
+# Telegram (comandos básicos)
 # ==============================
 def telegram_polling():
     if not (BOT_TOKEN and CHAT_ID):
-        print("ℹ️ Telegram polling desactivado (faltan credenciales)."); return
+        print("ℹ️ Telegram polling desactivado (faltan credenciales).")
+        return
+
     offset = None
     api = f"https://api.telegram.org/bot{BOT_TOKEN}"
     print("🛰️ Telegram polling iniciado.")
+
     while True:
         try:
             params = {"timeout": 50}
-            if offset is not None: params["offset"] = offset
+            if offset is not None:
+                params["offset"] = offset
+
             r = requests.get(f"{api}/getUpdates", params=params, timeout=60)
             r.raise_for_status()
             data = r.json()
-            if not data.get("ok"): time.sleep(3); continue
+            if not data.get("ok"):
+                time.sleep(3)
+                continue
 
             for upd in data.get("result", []):
                 offset = upd["update_id"] + 1
@@ -304,7 +311,8 @@ def telegram_polling():
                 chat = msg.get("chat", {})
                 text = (msg.get("text") or "").strip()
                 chat_id = str(chat.get("id") or "")
-                if not text or chat_id != str(CHAT_ID): continue
+                if not text or chat_id != str(CHAT_ID):
+                    continue
 
                 tlow = text.lower()
 
@@ -317,7 +325,7 @@ def telegram_polling():
                         idx = int(m.group(1))
                         if 1 <= idx <= len(URLS):
                             url = URLS[idx - 1]
-                            info = LAST_RESULTS.get(url, {"status":"UNKNOWN","detail":None,"ts":"","title":None})
+                            info = LAST_RESULTS.get(url, {"status": "UNKNOWN", "detail": None, "ts": "", "title": None})
                             tg_send(fmt_status_entry(url, info, include_url=False) + f"\n{SIGN}", force=True)
                         else:
                             tg_send(f"Índice fuera de rango (1–{len(URLS)}).{SIGN}", force=True)
@@ -330,51 +338,55 @@ def telegram_polling():
 
                 elif tlow.startswith("/debug"):
                     m = re.match(r"^/debug\s+(\d+)\s*$", tlow)
-                    if m:
-                        idx = int(m.group(1))
-                        if 1 <= idx <= len(URLS):
-                            url = URLS[idx - 1]
-                            with sync_playwright() as p:
-                                browser = p.chromium.launch(headless=True)
-                                page = browser.new_page()
-                
-                                page.goto(url, timeout=60000)
-                                page.wait_for_load_state("networkidle", timeout=15000)
-                                title = extract_title(page) or prettify_from_slug(url)
-                
-                                _open_dropdown_if_any(page)
-                                region = _find_functions_region(page)
-                                pre = _gather_dates_in_region(region)
-                
-                                post = pre[:]  # Oasis suele ser inline, sin popup
-                
-                                soldout = page_has_soldout(page)
-                                if pre or post:
-                                    decision = "AVAILABLE_BY_DATES"
-                                elif soldout:
-                                    decision = "SOLDOUT"
-                                else:
-                                    decision = "UNKNOWN"
-                
-                                # ✅ Cierre aquí, ANTES de enviar el mensaje
-                                browser.close()
-                
-                            tg_send(
-                                f"🧪 DEBUG — {title}\n"
-                                f"URL idx {idx}\n"
-                                f"decision_hint={decision}\n"
-                                f"pre: {', '.join(pre) if pre else '-'}\n"
-                                f"post: {', '.join(post) if post else '-'}\n{SIGN}",
-                                force=True
-                            )
-                        else:
-                            tg_send(f"Índice fuera de rango (1–{len(URLS)}).{SIGN}", force=True)
-                    else:
+                    if not m:
                         tg_send(f"Usá: /debug N (ej: /debug 2){SIGN}", force=True)
+                        continue
 
+                    idx = int(m.group(1))
+                    if not (1 <= idx <= len(URLS)):
+                        tg_send(f"Índice fuera de rango (1–{len(URLS)}).{SIGN}", force=True)
+                        continue
 
-        except Exception as e:
-            print("⚠️ Polling error:", e)
+                    url = URLS[idx - 1]
+                    # Abrimos Playwright en un bloque separado y lo cerramos limpio
+                    with sync_playwright() as p:
+                        browser = p.chromium.launch(headless=True)
+                        try:
+                            page = browser.new_page()
+                            page.goto(url, timeout=60000)
+                            page.wait_for_load_state("networkidle", timeout=15000)
+                            title = extract_title(page) or prettify_from_slug(url)
+
+                            _open_dropdown_if_any(page)
+                            region = _find_functions_region(page)
+                            pre = _gather_dates_in_region(region)
+                            post = pre[:]  # AllAccess suele ser inline
+
+                            soldout = page_has_soldout(page)
+                            if pre or post:
+                                decision = "AVAILABLE_BY_DATES"
+                            elif soldout:
+                                decision = "SOLDOUT"
+                            else:
+                                decision = "UNKNOWN"
+                        finally:
+                            # Cierre del browser SIEMPRE dentro del with
+                            try:
+                                browser.close()
+                            except Exception:
+                                pass
+
+                    tg_send(
+                        f"🧪 DEBUG — {title}\n"
+                        f"URL idx {idx}\n"
+                        f"decision_hint={decision}\n"
+                        f"pre: {', '.join(pre) if pre else '-'}\n"
+                        f"post: {', '.join(post) if post else '-'}\n{SIGN}",
+                        force=True
+                    )
+
+        except Exception:
+            print("⚠️ Polling error:", traceback.format_exc())
             time.sleep(5)
 
 # ==============================
@@ -386,40 +398,35 @@ def run_monitor():
         try:
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=True)
-                page = browser.new_page()
-
-                for url in URLS:
-                    try:
-                        fechas, title, hint = check_url(url, page)
-                        ts = now_local().strftime("%Y-%m-%d %H:%M:%S")
-
-                        if fechas:
-                            det = ", ".join(fechas)
-                            prev = LAST_RESULTS.get(url, {}).get("status")
-                            if prev != "AVAILABLE":
-                                tg_send(
-                                    f"✅ <b>¡Entradas disponibles!</b>\n{title or 'Show'}\nFechas: {det}\n{SIGN}"
-                                )
-                            LAST_RESULTS[url] = {
-                                "status": "AVAILABLE",
-                                "detail": det,
-                                "ts": ts,
-                                "title": title
-                            }
-                        else:
-                            if hint == "SOLDOUT":
-                                LAST_RESULTS[url] = {"status": "SOLDOUT", "detail": None, "ts": ts, "title": title}
-                            elif hint.startswith("AVAILABLE_NO_DATES"):
-                                LAST_RESULTS[url] = {"status": "AVAILABLE", "detail": None, "ts": ts, "title": title}
+                try:
+                    page = browser.new_page()
+                    for url in URLS:
+                        try:
+                            fechas, title, hint = check_url(url, page)
+                            ts = now_local().strftime("%Y-%m-%d %H:%M:%S")
+                            if fechas:
+                                det = ", ".join(fechas)
+                                prev = LAST_RESULTS.get(url, {}).get("status")
+                                if prev != "AVAILABLE":
+                                    tg_send(
+                                        f"✅ <b>¡Entradas disponibles!</b>\n{title or 'Show'}\nFechas: {det}\n{SIGN}"
+                                    )
+                                LAST_RESULTS[url] = {"status": "AVAILABLE", "detail": det, "ts": ts, "title": title}
                             else:
-                                LAST_RESULTS[url] = {"status": "UNKNOWN", "detail": None, "ts": ts, "title": title}
-                            print(f"{title or url} — {LAST_RESULTS[url]['status']} — {ts}")
-
-                # ✅ Cierra el navegador DESPUÉS del for, pero DENTRO del with
-                browser.close()
-
+                                if hint == "SOLDOUT":
+                                    LAST_RESULTS[url] = {"status": "SOLDOUT", "detail": None, "ts": ts, "title": title}
+                                elif hint.startswith("AVAILABLE_NO_DATES"):
+                                    LAST_RESULTS[url] = {"status": "AVAILABLE", "detail": None, "ts": ts, "title": title}
+                                else:
+                                    LAST_RESULTS[url] = {"status": "UNKNOWN", "detail": None, "ts": ts, "title": title}
+                                print(f"{title or url} — {LAST_RESULTS[url]['status']} — {ts}")
+                finally:
+                    # Cerrar el browser SIEMPRE antes de salir del with
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
             time.sleep(CHECK_EVERY)
-
         except Exception:
             print("💥 Error monitor:", traceback.format_exc())
             time.sleep(30)
