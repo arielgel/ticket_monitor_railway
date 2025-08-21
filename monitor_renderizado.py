@@ -337,17 +337,17 @@ def telegram_polling():
                             with sync_playwright() as p:
                                 browser = p.chromium.launch(headless=True)
                                 page = browser.new_page()
+                
                                 page.goto(url, timeout=60000)
                                 page.wait_for_load_state("networkidle", timeout=15000)
                                 title = extract_title(page) or prettify_from_slug(url)
-
+                
                                 _open_dropdown_if_any(page)
                                 region = _find_functions_region(page)
                                 pre = _gather_dates_in_region(region)
-
-                                # sin popup por ahora; Oasis/AllAccess suele ser inline
-                                post = pre[:]
-
+                
+                                post = pre[:]  # Oasis suele ser inline, sin popup
+                
                                 soldout = page_has_soldout(page)
                                 if pre or post:
                                     decision = "AVAILABLE_BY_DATES"
@@ -355,9 +355,10 @@ def telegram_polling():
                                     decision = "SOLDOUT"
                                 else:
                                     decision = "UNKNOWN"
-
+                
+                                # ✅ Cierre aquí, ANTES de enviar el mensaje
                                 browser.close()
-
+                
                             tg_send(
                                 f"🧪 DEBUG — {title}\n"
                                 f"URL idx {idx}\n"
@@ -370,6 +371,7 @@ def telegram_polling():
                             tg_send(f"Índice fuera de rango (1–{len(URLS)}).{SIGN}", force=True)
                     else:
                         tg_send(f"Usá: /debug N (ej: /debug 2){SIGN}", force=True)
+
 
         except Exception as e:
             print("⚠️ Polling error:", e)
@@ -385,27 +387,39 @@ def run_monitor():
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=True)
                 page = browser.new_page()
+
                 for url in URLS:
                     try:
                         fechas, title, hint = check_url(url, page)
                         ts = now_local().strftime("%Y-%m-%d %H:%M:%S")
+
                         if fechas:
                             det = ", ".join(fechas)
-                            # Aviso sólo cuando cambia a AVAILABLE o cuando no teníamos
                             prev = LAST_RESULTS.get(url, {}).get("status")
                             if prev != "AVAILABLE":
-                                tg_send(f"✅ <b>¡Entradas disponibles!</b>\n{title or 'Show'}\nFechas: {det}\n{SIGN}")
-                            LAST_RESULTS[url] = {"status":"AVAILABLE","detail":det,"ts":ts,"title":title}
+                                tg_send(
+                                    f"✅ <b>¡Entradas disponibles!</b>\n{title or 'Show'}\nFechas: {det}\n{SIGN}"
+                                )
+                            LAST_RESULTS[url] = {
+                                "status": "AVAILABLE",
+                                "detail": det,
+                                "ts": ts,
+                                "title": title
+                            }
                         else:
                             if hint == "SOLDOUT":
-                                LAST_RESULTS[url] = {"status":"SOLDOUT","detail":None,"ts":ts,"title":title}
+                                LAST_RESULTS[url] = {"status": "SOLDOUT", "detail": None, "ts": ts, "title": title}
                             elif hint.startswith("AVAILABLE_NO_DATES"):
-                                LAST_RESULTS[url] = {"status":"AVAILABLE","detail":None,"ts":ts,"title":title}
+                                LAST_RESULTS[url] = {"status": "AVAILABLE", "detail": None, "ts": ts, "title": title}
                             else:
-                                LAST_RESULTS[url] = {"status":"UNKNOWN","detail":None,"ts":ts,"title":title}
+                                LAST_RESULTS[url] = {"status": "UNKNOWN", "detail": None, "ts": ts, "title": title}
                             print(f"{title or url} — {LAST_RESULTS[url]['status']} — {ts}")
+
+                # ✅ Cierra el navegador DESPUÉS del for, pero DENTRO del with
                 browser.close()
+
             time.sleep(CHECK_EVERY)
+
         except Exception:
             print("💥 Error monitor:", traceback.format_exc())
             time.sleep(30)
