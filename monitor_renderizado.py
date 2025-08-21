@@ -8,6 +8,317 @@ from zoneinfo import ZoneInfo
 from playwright.sync_api import sync_playwright
 
 # ==============================
+# Sniffer de disponibilidad del mapa
+# ==============================
+import json
+
+# Palabras clave típicas en endpoints de mapa
+SEATMAP_ENDPOINT_HINTS = ("seat", "seats", "zones", "zone", "sections", "section", "map", "availability", "inventory")
+JSON_MIME_HINTS = ("application/json", "application/ld+json", "application/vnd.api+json")
+
+def _is_seatmap_like(url: str) -> bool:
+    u = url.lower()
+    return any(k in u for k in SEATMAP_ENDPOINT_HINTS)
+
+def _content_type_is_json(resp) -> bool:
+    try:
+        ct = resp.headers.get("content-type", "")
+        return any(h in ct for h in JSON_MIME_HINTS)
+    except Exception:
+        return False
+
+def _parse_availability_from_json(obj) -> list[tuple[str,int]]:
+    """
+    Heurística para distintas formas de JSON: buscamos estructuras con 'sector/zone/section' y 'available/remaining'.
+    Devuelve lista de (sector, disponibles>0).
+    """
+    out = []
+    def add(name, avail):
+        try:
+            avail = int(avail)
+        except Exception:
+            return
+        name = f"{name}".strip()
+        if name and avail > 0:
+            out.append((name, avail))
+
+    def walk(o):
+        if isinstance(o, dict):
+            # keys útiles
+            keys = {k.lower(): k for k in o.keys()}
+            # nombres
+            name = o.get(keys.get("name","name")) or o.get(keys.get("zone","zone")) or o.get(keys.get("section","section")) or o.get(keys.get("sector","sector"))
+            # disponibles
+            avail = None
+            for k in ["available","remaining","free","availability","stock","disponibles","cupos"]:
+                if k in keys:
+                    avail = o[keys[k]]
+                    break
+            # algunos payloads traen 'capacity' y 'sold', calculamos:
+            if avail is None and "capacity" in keys and "sold" in keys:
+                try:
+                    avail = int(o[keys["capacity"]]) - int(o[keys["sold"]])
+                except Exception:
+                    pass
+            if name is not None and avail is not None:
+                add(name, avail)
+            # bajar
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+    try:
+        walk(obj)
+    except Exception:
+        pass
+    # dedupe y ordenar por disponibles desc
+    ded = {}
+    for n,a in out:
+        ded[n] = max(ded.get(n,0), a)
+    return sorted(ded.items(), key=lambda x: (-x[1], x[0].lower()))
+
+def _sniff_seatmap_availability(page, wait_ms=4000) -> list[tuple[str,int]]:
+    """
+    Escucha respuestas durante wait_ms y devuelve sectores disponibles detectados por JSON.
+    """
+    found = []
+
+    def on_response(resp):
+        try:
+            url = resp.url
+            if not _is_seatmap_like(url):
+                return
+            if resp.status < 200 or resp.status >= 400:
+                return
+            if not _content_type_is_json(resp):
+                return
+            txt = resp.text()
+            if not txt or len(txt) < 2:
+                return
+            obj = json.loads(txt)
+            cand = _parse_availability_from_json(obj)
+            if cand:
+                found.extend(cand)
+        except Exception:
+            return
+
+    page.on("response", on_response)
+    try:
+        page.wait_for_timeout(wait_ms)
+    finally:
+        try:
+            page.off("response", on_response)
+        except Exception:
+            pass
+
+    # dedupe final
+    ded = {}
+    for n,a in found:
+        ded[n] = max(ded.get(n,0), a)
+    return sorted(ded.items(), key=lambda x: (-x[1], x[0].lower()))
+
+# ==============================
+# Plan B DOM: leer sectores visibles en el mapa
+# ==============================
+SECTOR_HINT_SELECTORS = [
+    "[class*='sector']",
+    "[class*='zona']",
+    "[class*='zone']",
+    "[class*='section']",
+    "[data-testid*='sector']",
+    "[data-testid*='zone']",
+    ".legend li", ".legend .item",
+    ".map-legend li", ".map-legend .item",
+    "[role='list'] [role='listitem']",
+]
+
+def _parse_sector_text(txt: str) -> tuple[str,int|None,bool]:
+    """
+    Intenta extraer (nombre, disponibles?, agotado?).
+    Ejs de textos: "Campo A — Disponible", "Platea Lateral (43)", "VIP - Agotado".
+    """
+    t = (txt or "").strip()
+    tlow = t.lower()
+    agot = any(k in tlow for k in ["agotado","sold out","sin disponibilidad","no disponible"])
+    # buscar número entre paréntesis
+    m = re.search(r"\((\d{1,4})\)", t)
+    avail = int(m.group(1)) if m else None
+    # limpiar nombre
+    name = re.sub(r"\s*[-—–]\s*(agotado|sold out|sin disponibilidad).*", "", t, flags=re.I)
+    name = re.sub(r"\(\d{1,4}\)", "", name).strip(" -—–\t")
+    return name, avail, agot
+
+def _read_sectors_from_dom(page) -> list[tuple[str,int]]:
+    out = []
+    try:
+        nodes = page.locator(", ".join(SECTOR_HINT_SELECTORS))
+        n = min(nodes.count(), 200)
+        for i in range(n):
+            it = nodes.nth(i)
+            try:
+                txt = (it.inner_text(timeout=250) or "").strip()
+            except Exception:
+                txt = ""
+            if not txt:
+                continue
+            name, avail, agot = _parse_sector_text(txt)
+            if not name or agot:
+                continue
+            out.append((name, avail if isinstance(avail,int) else 1))  # si no hay número pero no dice agotado, asumimos 1+
+    except Exception:
+        pass
+    # dedupe y ordenar
+    ded = {}
+    for n,a in out:
+        ded[n] = max(ded.get(n,0), a)
+    return sorted(ded.items(), key=lambda x: (-x[1], x[0].lower()))
+
+# ==============================
+# Selección de fecha → mapa → extracción
+# ==============================
+def _open_map_for_date(dest_page) -> None:
+    """
+    Intenta abrir/mostrar el mapa (depende del flujo).
+    A veces ya está visible; si no, click en 'Ver mapa', 'Seleccionar ubicación', etc.
+    """
+    triggers = [
+        "button:has-text('Ver mapa')", "a:has-text('Ver mapa')",
+        "button:has-text('Seleccionar ubicación')",
+        "button:has-text('Seleccionar ubicaciones')",
+        "button:has-text('Elegir ubicación')",
+        "button:has-text('Elegir ubicaciones')",
+        "[data-testid*='mapa']", "[data-testid*='seatmap']",
+    ]
+    for sel in triggers:
+        try:
+            btn = dest_page.locator(sel).first
+            if btn and btn.count() > 0:
+                btn.click(timeout=1500, force=True)
+                dest_page.wait_for_timeout(400)
+                break
+        except Exception:
+            continue
+    # esperar algo típico de mapa
+    try:
+        dest_page.wait_for_selector(", ".join(SECTOR_HINT_SELECTORS), timeout=3000)
+    except Exception:
+        pass
+
+def _choose_function_by_label(page, label: str) -> 'playwright.sync_api.Page':
+    """
+    Hace click en la fecha/función cuyo label contiene la fecha DD/MM/YYYY.
+    Luego devuelve la page de destino (popup o inline) donde está el mapa/checkout.
+    """
+    # intentar abrir dropdown/menú por si hace falta
+    _open_dropdown_if_any(page)
+
+    # buscar item con esa fecha
+    candidates = [
+        "[role='listbox'] [role='option']",
+        ".MuiMenuItem-root",
+        "select option",
+        "li", "button", "a", "div"
+    ]
+    found = None
+    for sel in candidates:
+        try:
+            items = page.locator(sel)
+            n = min(items.count(), 200)
+            for i in range(n):
+                it = items.nth(i)
+                try:
+                    txt = (it.inner_text(timeout=200) or "").strip()
+                except Exception:
+                    txt = ""
+                if label in txt:
+                    found = it; break
+            if found: break
+        except Exception:
+            continue
+    if not found:
+        return page
+
+    # click → popup o inline
+    try:
+        with page.expect_popup() as pinfo:
+            found.click(timeout=1500, force=True)
+        dest = pinfo.value
+        try: dest.wait_for_load_state("domcontentloaded", timeout=5000)
+        except Exception: pass
+        return dest
+    except Exception:
+        # quizá es inline
+        found.click(timeout=1500, force=True)
+        try: page.wait_for_load_state("domcontentloaded", timeout=5000)
+        except Exception: pass
+        return page
+
+def _extract_sectors_for_date(dest) -> list[tuple[str,int]]:
+    """
+    Preferimos API (sniffer). Si no aparece nada, leemos DOM del mapa.
+    """
+    # dar unos ms para que dispare requests del mapa
+    _open_map_for_date(dest)
+    sectors = _sniff_seatmap_availability(dest, wait_ms=4000)
+    if sectors:
+        return sectors
+    # plan B DOM
+    return _read_sectors_from_dom(dest)
+
+# ==============================
+# Comando Telegram: /sectores N
+# ==============================
+def cmd_list_sectors_for_show_index(idx: int):
+    url = URLS[idx - 1]
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        try:
+            page.goto(url, timeout=60000)
+            page.wait_for_load_state("networkidle", timeout=15000)
+            title = extract_title(page) or prettify_from_slug(url)
+
+            # 1) Listar fechas válidas (reutilizamos tu pipeline)
+            region = _find_functions_region(page)
+            fechas = _gather_dates_in_region(region)  # dd/mm/yyyy ya filtradas/ordenadas
+
+            if not fechas:
+                tg_send(f"❓ Sin fechas visibles en {title}{SIGN}", force=True)
+                return
+
+            lines = [f"🧭 <b>{title}</b> — Sectores disponibles:"]
+            for f in fechas:
+                # 2) Selecciono fecha → destino
+                dest = _choose_function_by_label(page, f)
+                try:
+                    dest.wait_for_load_state("networkidle", timeout=6000)
+                except Exception:
+                    pass
+
+                # 3) Extraigo sectores
+                sectors = _extract_sectors_for_date(dest)
+                if sectors:
+                    nice = ", ".join([f"{n} ({a})" for n,a in sectors])
+                    lines.append(f"{f}: {nice}")
+                else:
+                    lines.append(f"{f}: —")
+
+                # cerrar popup si es distinto
+                if dest is not page:
+                    try: dest.close()
+                    except Exception: pass
+
+            tg_send("\n".join(lines) + f"\n{SIGN}", force=True)
+
+        except Exception as e:
+            tg_send(f"💥 Error /sectores {idx}: {e}{SIGN}", force=True)
+        finally:
+            try: browser.close()
+            except Exception: pass
+
+
+# ==============================
 # Config
 # ==============================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -542,6 +853,18 @@ def telegram_polling():
                             tg_send(f"Índice fuera de rango (1–{len(URLS)}).{SIGN}", force=True)
                     else:
                         tg_send(f"Usá: /debug N (ej: /debug 2){SIGN}", force=True)
+				elif tlow.startswith("/sectores"):
+                    m = re.match(r"^/sectores\s+(\d+)\s*$", tlow)
+                    if m:
+                        idx = int(m.group(1))
+                        if 1 <= idx <= len(URLS):
+                            tg_send(f"⏳ Buscando sectores por fecha del show #{idx}…{SIGN}", force=True)
+                            threading.Thread(target=cmd_list_sectors_for_show_index, args=(idx,), daemon=True).start()
+                        else:
+                            tg_send(f"Índice fuera de rango (1–{len(URLS)}).{SIGN}", force=True)
+                    else:
+                        tg_send(f"Usá: /sectores N (ej: /sectores 2){SIGN}", force=True)
+
         except Exception as e:
             print("⚠️ Polling error:", e)
             time.sleep(5)
