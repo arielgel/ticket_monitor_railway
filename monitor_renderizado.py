@@ -689,31 +689,27 @@ def run_monitor():
         try:
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=True)
-                try:
-                    page = browser.new_page()
-                    for url in URLS:
-                        try:
-                            fechas, title, hint = check_url(url, page)
-                            ts = now_local().strftime("%Y-%m-%d %H:%M:%S")
-                            if fechas:
-                                det = ", ".join(fechas)
-                                prev = LAST_RESULTS.get(url, {}).get("status")
-                                if prev != "AVAILABLE":
-                                    tg_send(
-                                        f"✅ <b>¡Entradas disponibles!</b>\n{title or 'Show'}\nFechas: {det}\n{SIGN}"
-                                    )
-                                LAST_RESULTS[url] = {"status": "AVAILABLE", "detail": det, "ts": ts, "title": title}
-                            else:
-                                if hint == "SOLDOUT":
-                                    LAST_RESULTS[url] = {"status": "SOLDOUT", "detail": None, "ts": ts, "title": title}
-                                else:
-                                    LAST_RESULTS[url] = {"status": "UNKNOWN", "detail": None, "ts": ts, "title": title}
-                                print(f"{title or url} — {LAST_RESULTS[url]['status']} — {ts}")
-                finally:
+                page = browser.new_page()
+                for url in URLS:
                     try:
-                        browser.close()
-                    except Exception:
-                        pass
+                        fechas, title, hint = check_url(url, page)
+                        ts = now_local().strftime("%Y-%m-%d %H:%M:%S")
+                        if fechas:
+                            det = ", ".join(fechas)
+                            prev = LAST_RESULTS.get(url, {}).get("status")
+                            if prev != "AVAILABLE":
+                                tg_send(
+                                    f"✅ <b>¡Entradas disponibles!</b>\n{title or 'Show'}\nFechas: {det}\n{SIGN}"
+                                )
+                            LAST_RESULTS[url] = {"status": "AVAILABLE", "detail": det, "ts": ts, "title": title}
+                        else:
+                            if hint == "SOLDOUT":
+                                LAST_RESULTS[url] = {"status": "SOLDOUT", "detail": None, "ts": ts, "title": title}
+                            else:
+                                LAST_RESULTS[url] = {"status": "UNKNOWN", "detail": None, "ts": ts, "title": title}
+                            print(f"{title or url} — {LAST_RESULTS[url]['status']} — {ts}")
+                # cierre normal del browser
+                browser.close()
             time.sleep(CHECK_EVERY)
         except Exception:
             print("💥 Error monitor:", traceback.format_exc())
@@ -731,3 +727,4 @@ if __name__ == "__main__":
         run_monitor()
     else:
         print("⚠️ Faltan variables de entorno TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID o URLs.")
+
