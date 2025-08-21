@@ -178,10 +178,6 @@ def _read_sectors_from_dom(page) -> list[tuple[str,int]]:
 # Selección de fecha → mapa → extracción
 # ==============================
 def _open_map_for_date(dest_page) -> None:
-    """
-    Intenta abrir/mostrar el mapa (depende del flujo).
-    A veces ya está visible; si no, click en 'Ver mapa', 'Seleccionar ubicación', etc.
-    """
     triggers = [
         "button:has-text('Ver mapa')", "a:has-text('Ver mapa')",
         "button:has-text('Seleccionar ubicación')",
@@ -189,70 +185,122 @@ def _open_map_for_date(dest_page) -> None:
         "button:has-text('Elegir ubicación')",
         "button:has-text('Elegir ubicaciones')",
         "[data-testid*='mapa']", "[data-testid*='seatmap']",
+        "button:has-text('Continuar')",  # a veces hay que avanzar un paso
     ]
     for sel in triggers:
         try:
             btn = dest_page.locator(sel).first
-            if btn and btn.count() > 0:
+            if btn and btn.count() > 0 and btn.is_visible():
                 btn.click(timeout=1500, force=True)
                 dest_page.wait_for_timeout(400)
-                break
         except Exception:
             continue
-    # esperar algo típico de mapa
+    # Esperar algo típico de mapa/leyenda/zonas
     try:
-        dest_page.wait_for_selector(", ".join(SECTOR_HINT_SELECTORS), timeout=3000)
+        dest_page.wait_for_selector(
+            ", ".join(SECTOR_HINT_SELECTORS),
+            timeout=4000,
+            state="visible"
+        )
     except Exception:
         pass
 
-def _choose_function_by_label(page, label: str) -> 'playwright.sync_api.Page':
+def _choose_function_by_label(page, label: str):
     """
-    Hace click en la fecha/función cuyo label contiene la fecha DD/MM/YYYY.
-    Luego devuelve la page de destino (popup o inline) donde está el mapa/checkout.
+    Selecciona la fecha/función indicada por 'label' (DD/MM/YYYY) usando:
+      1) opciones visibles en menús tipo portal/listbox,
+      2) opciones visibles en la región de funciones,
+      3) <select> por label (select_option),
+      4) fallback: cualquier nodo visible con el texto exacto.
+    Devuelve la page de destino (popup o inline).
     """
-    # intentar abrir dropdown/menú por si hace falta
+    # Asegurar que el menú esté abierto (si aplica)
     _open_dropdown_if_any(page)
+    page.wait_for_timeout(150)
 
-    # buscar item con esa fecha
-    candidates = [
-        "[role='listbox'] [role='option']",
-        ".MuiMenuItem-root",
-        "select option",
-        "li", "button", "a", "div"
-    ]
-    found = None
-    for sel in candidates:
+    # helpers
+    def _click_visible(locator):
+        locator.wait_for(state="visible", timeout=2500)
         try:
-            items = page.locator(sel)
-            n = min(items.count(), 200)
-            for i in range(n):
-                it = items.nth(i)
-                try:
-                    txt = (it.inner_text(timeout=200) or "").strip()
-                except Exception:
-                    txt = ""
-                if label in txt:
-                    found = it; break
-            if found: break
+            with page.expect_popup() as pinfo:
+                locator.click(timeout=1500, force=True)
+            popup = pinfo.value
+            try: popup.wait_for_load_state("domcontentloaded", timeout=5000)
+            except Exception: pass
+            return popup
+        except Exception:
+            # sin popup → inline
+            locator.click(timeout=1500, force=True)
+            try: page.wait_for_load_state("domcontentloaded", timeout=5000)
+            except Exception: pass
+            return page
+
+    # 1) Portal/listbox (Material UI y similares)
+    PORTAL_ITEM_SELECTORS = [
+        ".MuiPopover-root [role='listbox'] [role='option']",
+        ".MuiMenu-paper [role='listbox'] [role='option']",
+        ".MuiPopover-root li.MuiMenuItem-root",
+        ".MuiMenu-paper li.MuiMenuItem-root",
+        "[role='listbox'] [role='option']",
+    ]
+    for sel in PORTAL_ITEM_SELECTORS:
+        try:
+            loc = page.locator(sel).filter(has_text=label).first
+            if loc and loc.count() > 0:
+                return _click_visible(loc)
         except Exception:
             continue
-    if not found:
-        return page
 
-    # click → popup o inline
+    # 2) Dentro de la región de funciones
     try:
-        with page.expect_popup() as pinfo:
-            found.click(timeout=1500, force=True)
-        dest = pinfo.value
-        try: dest.wait_for_load_state("domcontentloaded", timeout=5000)
-        except Exception: pass
-        return dest
+        region = _find_functions_region(page)
     except Exception:
-        # quizá es inline
-        found.click(timeout=1500, force=True)
-        try: page.wait_for_load_state("domcontentloaded", timeout=5000)
-        except Exception: pass
-        return page
+        region = None
+    if region:
+        try:
+            cand = region.locator("[role='option'], li, .MuiMenuItem-root, button, a, div").filter(has_text=label)
+            # quedarnos con el visible
+            for i in range(min(cand.count(), 50)):
+                it = cand.nth(i)
+                try:
+                    if it.is_visible():
+                        return _click_visible(it)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    # 3) <select> por label
+    try:
+        if page.locator("select").count() > 0:
+            page.select_option("select", label=label)
+            page.wait_for_timeout(200)
+            # muchas veces tras seleccionar hay que darle a “Ver entradas”
+            for trig in ["button:has-text('Ver entradas')", "a:has-text('Ver entradas')",
+                         "button:has-text('Comprar')", "a:has-text('Comprar')"]:
+                btn = page.locator(trig).first
+                if btn and btn.count() > 0 and btn.is_visible():
+                    return _click_visible(btn)
+            # si no hay CTA, igual devolvemos la misma page
+            return page
+    except Exception:
+        pass
+
+    # 4) Fallback: cualquier nodo visible con el texto exacto
+    try:
+        anynode = page.get_by_text(label, exact=True)
+        if anynode and anynode.count() > 0:
+            # buscar el primero visible
+            n = min(anynode.count(), 20)
+            for i in range(n):
+                it = anynode.nth(i)
+                if it.is_visible():
+                    return _click_visible(it)
+    except Exception:
+        pass
+
+    # No se pudo
+    return page
 
 def _extract_sectors_for_date(dest) -> list[tuple[str,int]]:
     """
@@ -291,13 +339,12 @@ def cmd_list_sectors_for_show_index(idx: int):
             for f in fechas:
                 # 2) Selecciono fecha → destino
                 dest = _choose_function_by_label(page, f)
-                try:
-                    dest.wait_for_load_state("networkidle", timeout=6000)
-                except Exception:
-                    pass
-
-                # 3) Extraigo sectores
-                sectors = _extract_sectors_for_date(dest)
+				try:
+					dest.wait_for_load_state("domcontentloaded", timeout=6000)
+				except Exception:
+					pass
+				dest.wait_for_timeout(400)  # dar aire para que renderice/monte el mapa
+				sectors = _extract_sectors_for_date(dest)
                 if sectors:
                     nice = ", ".join([f"{n} ({a})" for n,a in sectors])
                     lines.append(f"{f}: {nice}")
