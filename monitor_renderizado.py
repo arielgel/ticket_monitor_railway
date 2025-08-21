@@ -27,8 +27,38 @@ URLS = [u.strip() for u in _urls_norm.split(",") if u.strip()]
 
 CHECK_EVERY = int(_get_env_any("CHECK_EVERY_SECONDS", "CHECK_EVERY", default="300"))
 TZ_NAME = _get_env_any("TIMEZONE", "TZ", "TZ_NAME", default="America/Argentina/Buenos_Aires")
-QUIET_START = int(_get_env_any("QUIET_START", default="0"))
-QUIET_END = int(_get_env_any("QUIET_END", default="9"))
+# --- reemplazá este bloque ---
+# QUIET_START = int(_get_env_any("QUIET_START", default="0"))
+# QUIET_END   = int(_get_env_any("QUIET_END",   default="9"))
+
+# --- por este bloque robusto ---
+def _parse_hour(hstr: str, default_hour: int) -> int:
+    """
+    Acepta '0', '9', '00:00', '09:00', '23', '23:59'.
+    Devuelve una hora (0..23). Si no puede parsear, usa default_hour.
+    """
+    try:
+        if not hstr:
+            return default_hour
+        hstr = str(hstr).strip()
+        # Formato HH:MM
+        if ":" in hstr:
+            hh = hstr.split(":", 1)[0]
+            h = int(hh)
+        else:
+            h = int(hstr)
+        if 0 <= h <= 23:
+            return h
+    except Exception:
+        pass
+    return default_hour
+
+QUIET_START = _parse_hour(_get_env_any("QUIET_START", default="0"), default_hour=0)
+QUIET_END   = _parse_hour(_get_env_any("QUIET_END",   default="9"), default_hour=9)
+
+# Log amigable para ver qué tomó realmente (no es secreto)
+print(f"[QuietHours] QUIET_START={QUIET_START} QUIET_END={QUIET_END}")
+
 
 SIGN = " — Roberto"
 
