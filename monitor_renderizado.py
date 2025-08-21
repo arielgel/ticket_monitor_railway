@@ -1,10 +1,15 @@
-import os, re, time, requests, traceback
-from datetime import datetime
+import os
+import re
+import time
+import threading
+import traceback
+import requests
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from playwright.sync_api import sync_playwright
 
 # ==============================
-# Config (retro-compatible con tus envs de Railway)
+# Config retro-compatible (Railway)
 # ==============================
 def _get_env_any(*names, default=""):
     for n in names:
@@ -21,183 +26,399 @@ URLS_RAW    = _get_env_any("URLS", "MONITORED_URLS", "URL", default="")
 _raw = URLS_RAW.replace(";", ",")
 URLS = [u.strip() for u in _raw.split(",") if u.strip()]
 
-# Intervalo de chequeo (segundos)
 CHECK_EVERY = int(_get_env_any("CHECK_EVERY_SECONDS", "CHECK_EVERY", default="300"))
-
-# Zona horaria
 TZ_NAME     = _get_env_any("TIMEZONE", "TZ", "TZ_NAME", default="America/Argentina/Buenos_Aires")
 
+# silencio nocturno opcional (0–9 por defecto). Cambiar con QUIET_START/QUIET_END (hora 0-23)
+QUIET_START = int(_get_env_any("QUIET_START", default="0"))
+QUIET_END   = int(_get_env_any("QUIET_END",   default="9"))
 
-# --- Utilidades ---
+SIGN = " — Roberto"
+
+# ==============================
+# Estado
+# ==============================
+LAST_RESULTS = {u: {"status": "UNKNOWN", "detail": None, "ts": "", "title": None} for u in URLS}
+
+# ==============================
+# Utilitarios
+# ==============================
 def now_local():
     return datetime.now(ZoneInfo(TZ_NAME))
 
-def send_telegram(msg: str):
-    if not BOT_TOKEN or not CHAT_ID:
-        print("⚠️ Falta TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID")
-        return
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    try:
-        requests.post(url, json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"})
-    except Exception as e:
-        print(f"❌ Error Telegram: {e}")
+def within_quiet_hours():
+    h = now_local().hour
+    # rango [QUIET_START, QUIET_END)
+    if QUIET_START <= QUIET_END:
+        return QUIET_START <= h < QUIET_END
+    # rango que cruza medianoche (ej 22–7)
+    return h >= QUIET_START or h < QUIET_END
 
+def tg_send(text: str, force: bool = False):
+    if not force and within_quiet_hours():
+        print("⏸️ Silenciado:", text); return
+    if BOT_TOKEN and CHAT_ID:
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                data={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"},
+                timeout=20,
+            ).raise_for_status()
+        except Exception as e:
+            print("❌ Error Telegram:", e)
+    print(text)
+
+def prettify_from_slug(url: str) -> str:
+    slug = url.rstrip("/").split("/")[-1]
+    return slug.replace("-", " ").title()
+
+# ==============================
+# Extracción de título
+# ==============================
 def extract_title(page):
+    title = ""
     try:
-        h1 = page.query_selector("h1")
-        if h1:
-            return (h1.inner_text() or "").strip()
-    except: pass
-    return "¿Sin título?"
-
-def page_has_buy(page):
+        og = page.locator('meta[property="og:title"]').first
+        if og and og.count() > 0:
+            c = (og.get_attribute("content") or "").strip()
+            if c: title = c
+    except Exception:
+        pass
     try:
-        for btn in page.query_selector_all("button, a")[:100]:
-            t = (btn.inner_text() or "").lower()
-            if any(k in t for k in ["comprar", "entradas", "buy"]):
-                return True
-    except: pass
-    return False
+        if not title:
+            title = (page.title() or "").strip()
+    except Exception:
+        pass
+    if not title:
+        for sel in ["h1", ".event-title", "[data-testid='event-title']", "header h1"]:
+            try:
+                h = page.locator(sel).first
+                if h and h.count() > 0:
+                    title = (h.inner_text() or "").strip()
+                    if title: break
+            except Exception:
+                continue
+    title = re.sub(r"\s*\|\s*All\s*Access.*$", "", title, flags=re.I)
+    return title or None
 
-def page_has_soldout(page):
-    txt = page.inner_text("body").lower()
-    return any(k in txt for k in ["agotado", "sold out", "sin disponibilidad"])
+# ==============================
+# Detectores globales simples
+# ==============================
+def page_text(page) -> str:
+    try:
+        return (page.evaluate("() => document.body.innerText") or "").lower()
+    except Exception:
+        return ""
 
-def scan_dates(page):
-    """Busca patrones de fecha dd/mm/yyyy en todo el body"""
-    txt = page.inner_text("body")
-    found = re.findall(r"\b\d{2}/\d{2}/\d{4}\b", txt)
-    return list(dict.fromkeys(found))  # únicas, en orden
+def page_has_soldout(page) -> bool:
+    t = page_text(page)
+    return any(k in t for k in ["agotado", "sold out", "sin disponibilidad", "sem disponibilidade"])
 
-# --- Core ---
+# ==============================
+# Región de funciones (AllAccess)
+# ==============================
+def _nearest_block(locator, max_up=8):
+    for lvl in range(1, max_up + 1):
+        try:
+            anc = locator.locator(f":scope >> xpath=ancestor::*[{lvl}]")
+            if anc and anc.count() > 0:
+                try:
+                    bb = anc.bounding_box()
+                    txt = (anc.inner_text(timeout=250) or "").strip()
+                except Exception:
+                    bb, txt = None, ""
+                if bb and len(txt) > 10:
+                    return anc.first
+        except Exception:
+            continue
+    return locator if locator and locator.count() > 0 else None
+
+def _find_functions_region(page):
+    # 1) label
+    for sel in ["text=Selecciona la función", "text=Seleccioná la función"]:
+        try:
+            node = page.locator(sel).first
+            if node and node.count() > 0:
+                return _nearest_block(node, max_up=8)
+        except Exception:
+            continue
+    # 2) botón “Ver entradas”
+    for sel in ["button:has-text('Ver entradas')", "a:has-text('Ver entradas')"]:
+        try:
+            node = page.locator(sel).first
+            if node and node.count() > 0:
+                return _nearest_block(node, max_up=8)
+        except Exception:
+            continue
+    # 3) listbox visible
+    try:
+        lb = page.locator("[role='listbox']").first
+        if lb and lb.count() > 0:
+            return _nearest_block(lb, max_up=6)
+    except Exception:
+        pass
+    return None
+
+def _open_dropdown_if_any(page):
+    triggers = [
+        "button[aria-haspopup='listbox']",
+        "[role='combobox']",
+        "[aria-controls*='menu']",
+        "[data-testid*='select']",
+        ".MuiSelect-select",
+        "button:has-text('Selecciona la función')",
+        "button:has-text('Seleccioná la función')",
+        "button:has-text('Seleccionar')",
+        "button:has-text('Seleccioná')",
+    ]
+    for sel in triggers:
+        try:
+            loc = page.locator(sel).first
+            if loc and loc.count() > 0:
+                loc.click(timeout=1500, force=True)
+                page.wait_for_timeout(250)
+        except Exception:
+            continue
+    try:
+        page.wait_for_selector(".MuiPopover-root, .MuiMenu-paper, [role='listbox']", timeout=1200)
+    except Exception:
+        pass
+
+RE_DATE = re.compile(r"\b(\d{2}/\d{2}/\d{4})\b")
+
+def _gather_dates_in_region(region):
+    if not region:
+        return []
+    fechas, seen = [], set()
+
+    try:
+        items = region.locator("[role='option'], .MuiMenuItem-root, li, option, button, a, div")
+        n = min(items.count(), 200)
+        for i in range(n):
+            it = items.nth(i)
+            try:
+                txt = (it.inner_text(timeout=250) or "").strip()
+            except Exception:
+                txt = ""
+            low = txt.lower()
+            if not txt or "agotado" in low or "sold out" in low or "sin disponibilidad" in low:
+                continue
+            for d in RE_DATE.findall(txt):
+                if d not in seen:
+                    seen.add(d); fechas.append(d)
+    except Exception:
+        pass
+
+    try:
+        raw = (region.inner_text(timeout=400) or "").strip()
+        for d in RE_DATE.findall(raw):
+            if d not in seen:
+                seen.add(d); fechas.append(d)
+    except Exception:
+        pass
+
+    # únicas y orden dd/mm/yyyy
+    fechas = sorted(set(fechas), key=lambda s: (s[-4:], s[3:5], s[0:2]))
+    return fechas
+
+# ==============================
+# Chequeo principal de una URL
+# ==============================
 def check_url(url: str, page):
-    fechas = []
-    title = None
+    fechas, title = [], None
     status_hint = "UNKNOWN"
-
     try:
         page.goto(url, timeout=60000)
         page.wait_for_load_state("networkidle", timeout=15000)
+
         title = extract_title(page)
 
-        has_buy = page_has_buy(page)
-        has_sold = page_has_soldout(page)
+        _open_dropdown_if_any(page)
+        region = _find_functions_region(page)
+        fechas = _gather_dates_in_region(region)
 
-        # Buscar fechas
-        fechas = scan_dates(page)
-
-        # Nueva lógica de hint
         if fechas:
             status_hint = "AVAILABLE_BY_DATES"
-        elif has_buy and not fechas:
-            status_hint = "AVAILABLE_NO_DATES"
-        elif has_sold:
-            status_hint = "SOLDOUT"
         else:
-            status_hint = "UNKNOWN"
-
+            if page_has_soldout(page):
+                status_hint = "SOLDOUT"
+            elif region and region.locator("a:has-text('Comprar'), button:has-text('Comprar')").count() > 0:
+                status_hint = "AVAILABLE_NO_DATES"
+            else:
+                status_hint = "UNKNOWN"
     except Exception as e:
         print(f"⚠️ Error en check_url {url}: {e}")
 
     return fechas, title, status_hint
 
-# --- Telegram Polling ---
+# ==============================
+# Formateo de salida
+# ==============================
+def fmt_status_entry(url: str, info: dict, include_url: bool = False) -> str:
+    title = info.get("title") or prettify_from_slug(url)
+    st = info.get("status", "UNKNOWN")
+    det = info.get("detail") or ""
+    ts = info.get("ts", "")
+    head = title if not include_url else f"{title}\n{url}"
+
+    if st.startswith("AVAILABLE"):
+        line = f"✅ <b>¡Entradas disponibles!</b>\n{head}"
+        if det: line += f"\nFechas: {det}"
+    elif st == "SOLDOUT":
+        line = f"⛔ Agotado — {head}"
+    else:
+        line = f"❓ Indeterminado — {head}"
+        if det: line += f"\nNota: {det}"
+    if ts: line += f"\nÚltimo check: {ts}"
+    return line
+
+def fmt_shows_indexed() -> str:
+    lines = ["🎯 Monitoreando:"]
+    for i, u in enumerate(URLS, start=1):
+        info = LAST_RESULTS.get(u) or {}
+        title = info.get("title") or prettify_from_slug(u)
+        lines.append(f"{i}. {title}")
+    return "\n".join(lines) + f"\n{SIGN}"
+
+# ==============================
+# Telegram polling (comandos)
+# ==============================
 def telegram_polling():
-    last_update = 0
+    if not (BOT_TOKEN and CHAT_ID):
+        print("ℹ️ Telegram polling desactivado (faltan credenciales)."); return
+    offset = None
+    api = f"https://api.telegram.org/bot{BOT_TOKEN}"
+    print("🛰️ Telegram polling iniciado.")
     while True:
         try:
-            url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?offset={last_update+1}&timeout=20"
-            r = requests.get(url, timeout=30).json()
-            if "result" not in r: 
-                continue
-            for upd in r["result"]:
-                last_update = upd["update_id"]
-                if "message" not in upd: 
-                    continue
-                msg = upd["message"]
-                txt = msg.get("text","").strip()
-                if not txt: continue
+            params = {"timeout": 50}
+            if offset is not None: params["offset"] = offset
+            r = requests.get(f"{api}/getUpdates", params=params, timeout=60)
+            r.raise_for_status()
+            data = r.json()
+            if not data.get("ok"): time.sleep(3); continue
 
-                tlow = txt.lower()
-                if tlow.startswith("/status"):
-                    parts = txt.split()
-                    if len(parts) > 1 and parts[1].isdigit():
-                        idx = int(parts[1])
+            for upd in data.get("result", []):
+                offset = upd["update_id"] + 1
+                msg = upd.get("message") or {}
+                chat = msg.get("chat", {})
+                text = (msg.get("text") or "").strip()
+                chat_id = str(chat.get("id") or "")
+                if not text or chat_id != str(CHAT_ID): continue
+
+                tlow = text.lower()
+
+                if tlow.startswith("/shows"):
+                    tg_send(fmt_shows_indexed(), force=True)
+
+                elif tlow.startswith("/status"):
+                    m = re.match(r"^/status\s+(\d+)\s*$", tlow)
+                    if m:
+                        idx = int(m.group(1))
                         if 1 <= idx <= len(URLS):
-                            with sync_playwright() as pw:
-                                browser = pw.chromium.launch(headless=True)
-                                page = browser.new_page()
-                                fechas, title, hint = check_url(URLS[idx-1], page)
-                                browser.close()
-                            if hint.startswith("AVAILABLE"):
-                                fstr = ", ".join(fechas) if fechas else "(sin fecha)"
-                                send_telegram(f"✅ **Disponible** — {title}\nFechas: {fstr}\nÚltimo check: {now_local():%Y-%m-%d %H:%M:%S}\n — Roberto")
-                            elif hint == "SOLDOUT":
-                                send_telegram(f"⛔ Agotado — {title}\nÚltimo check: {now_local():%Y-%m-%d %H:%M:%S}\n — Roberto")
-                            else:
-                                send_telegram(f"❓ Indeterminado — {title}\nÚltimo check: {now_local():%Y-%m-%d %H:%M:%S}\n — Roberto")
+                            url = URLS[idx - 1]
+                            info = LAST_RESULTS.get(url, {"status":"UNKNOWN","detail":None,"ts":"","title":None})
+                            tg_send(fmt_status_entry(url, info, include_url=False) + f"\n{SIGN}", force=True)
                         else:
-                            send_telegram("⚠️ Índice fuera de rango.")
+                            tg_send(f"Índice fuera de rango (1–{len(URLS)}).{SIGN}", force=True)
                     else:
-                        out = []
-                        for i,u in enumerate(URLS, start=1):
-                            with sync_playwright() as pw:
-                                browser = pw.chromium.launch(headless=True)
-                                page = browser.new_page()
-                                title = extract_title(page) if page else u
-                                browser.close()
-                            out.append(f"{i}. {title}")
-                        send_telegram("🎯 Monitoreando:\n" + "\n".join(out) + "\n — Roberto")
+                        snap = LAST_RESULTS.copy()
+                        lines = [f"📊 Estado actual (N={len(snap)}){SIGN}"]
+                        for url, info in snap.items():
+                            lines.append("• " + fmt_status_entry(url, info, include_url=False))
+                        tg_send("\n".join(lines), force=True)
 
                 elif tlow.startswith("/debug"):
-                    parts = txt.split()
-                    if len(parts) > 1 and parts[1].isdigit():
-                        idx = int(parts[1])
+                    m = re.match(r"^/debug\s+(\d+)\s*$", tlow)
+                    if m:
+                        idx = int(m.group(1))
                         if 1 <= idx <= len(URLS):
-                            with sync_playwright() as pw:
-                                browser = pw.chromium.launch(headless=True)
+                            url = URLS[idx - 1]
+                            with sync_playwright() as p:
+                                browser = p.chromium.launch(headless=True)
                                 page = browser.new_page()
-                                fechas, title, hint = check_url(URLS[idx-1], page)
+                                page.goto(url, timeout=60000)
+                                page.wait_for_load_state("networkidle", timeout=15000)
+                                title = extract_title(page) or prettify_from_slug(url)
+
+                                _open_dropdown_if_any(page)
+                                region = _find_functions_region(page)
+                                pre = _gather_dates_in_region(region)
+
+                                # sin popup por ahora; Oasis/AllAccess suele ser inline
+                                post = pre[:]
+
+                                soldout = page_has_soldout(page)
+                                if pre or post:
+                                    decision = "AVAILABLE_BY_DATES"
+                                elif soldout:
+                                    decision = "SOLDOUT"
+                                else:
+                                    decision = "UNKNOWN"
+
                                 browser.close()
-                            send_telegram(
+
+                            tg_send(
                                 f"🧪 DEBUG — {title}\n"
                                 f"URL idx {idx}\n"
-                                f"status_hint={hint}\n"
-                                f"pre/post: {', '.join(fechas) if fechas else '-'}\n — Roberto"
+                                f"decision_hint={decision}\n"
+                                f"pre: {', '.join(pre) if pre else '-'}\n"
+                                f"post: {', '.join(post) if post else '-'}\n{SIGN}",
+                                force=True
                             )
+                        else:
+                            tg_send(f"Índice fuera de rango (1–{len(URLS)}).{SIGN}", force=True)
+                    else:
+                        tg_send(f"Usá: /debug N (ej: /debug 2){SIGN}", force=True)
 
         except Exception as e:
-            print(f"❌ Error polling: {e}")
+            print("⚠️ Polling error:", e)
             time.sleep(5)
 
-# --- Loop principal ---
-def monitor_loop():
+# ==============================
+# Loop principal
+# ==============================
+def run_monitor():
+    tg_send(f"🔎 Radar levantado (URLs: {len(URLS)}){SIGN}", force=True)
     while True:
         try:
-            with sync_playwright() as pw:
-                browser = pw.chromium.launch(headless=True)
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
                 page = browser.new_page()
-                for i,url in enumerate(URLS, start=1):
-                    fechas, title, hint = check_url(url, page)
-                    if hint.startswith("AVAILABLE"):
-                        fstr = ", ".join(fechas) if fechas else "(sin fecha)"
-                        send_telegram(f"✅ **Disponible** — {title}\nFechas: {fstr}\nÚltimo check: {now_local():%Y-%m-%d %H:%M:%S}\n — Roberto")
-                    elif hint == "SOLDOUT":
-                        send_telegram(f"⛔ Agotado — {title}\nÚltimo check: {now_local():%Y-%m-%d %H:%M:%S}\n — Roberto")
-                    else:
-                        print(f"❓ Indeterminado — {title}")
+                for url in URLS:
+                    try:
+                        fechas, title, hint = check_url(url, page)
+                        ts = now_local().strftime("%Y-%m-%d %H:%M:%S")
+                        if fechas:
+                            det = ", ".join(fechas)
+                            # Aviso sólo cuando cambia a AVAILABLE o cuando no teníamos
+                            prev = LAST_RESULTS.get(url, {}).get("status")
+                            if prev != "AVAILABLE":
+                                tg_send(f"✅ <b>¡Entradas disponibles!</b>\n{title or 'Show'}\nFechas: {det}\n{SIGN}")
+                            LAST_RESULTS[url] = {"status":"AVAILABLE","detail":det,"ts":ts,"title":title}
+                        else:
+                            if hint == "SOLDOUT":
+                                LAST_RESULTS[url] = {"status":"SOLDOUT","detail":None,"ts":ts,"title":title}
+                            elif hint.startswith("AVAILABLE_NO_DATES"):
+                                LAST_RESULTS[url] = {"status":"AVAILABLE","detail":None,"ts":ts,"title":title}
+                            else:
+                                LAST_RESULTS[url] = {"status":"UNKNOWN","detail":None,"ts":ts,"title":title}
+                            print(f"{title or url} — {LAST_RESULTS[url]['status']} — {ts}")
                 browser.close()
             time.sleep(CHECK_EVERY)
-        except Exception as e:
-            print(f"💥 Error monitor_loop: {traceback.format_exc()}")
+        except Exception:
+            print("💥 Error monitor:", traceback.format_exc())
             time.sleep(30)
 
-# --- Main ---
+# ==============================
+# Main
+# ==============================
 if __name__ == "__main__":
+    if not URLS:
+        print("⚠️ No hay URLs (variables URLS / MONITORED_URLS / URL vacías).")
     if BOT_TOKEN and CHAT_ID and URLS:
-        import threading
         t = threading.Thread(target=telegram_polling, daemon=True)
         t.start()
-        monitor_loop()
+        run_monitor()
     else:
-        print("⚠️ Faltan variables de entorno BOT_TOKEN, CHAT_ID o URLS.")
+        print("⚠️ Faltan variables de entorno TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID o URLs.")
