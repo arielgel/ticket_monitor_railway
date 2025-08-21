@@ -338,13 +338,13 @@ def cmd_list_sectors_for_show_index(idx: int):
             lines = [f"🧭 <b>{title}</b> — Sectores disponibles:"]
             for f in fechas:
                 # 2) Selecciono fecha → destino		
-				dest = _choose_function_by_label(page, f)
-				try:
-					dest.wait_for_load_state("domcontentloaded", timeout=6000)
-				except Exception:
-					pass
-				dest.wait_for_timeout(400)  # dar aire para que renderice/monte el mapa
-				sectors = _extract_sectors_for_date(dest)
+                dest = _choose_function_by_label(page, f)
+                try:
+                    dest.wait_for_load_state("domcontentloaded", timeout=6000)
+                except Exception:
+                    pass
+                dest.wait_for_timeout(400)  # dar aire para que renderice/monte el mapa
+                sectors = _extract_sectors_for_date(dest)
                 if sectors:
                     nice = ", ".join([f"{n} ({a})" for n,a in sectors])
                     lines.append(f"{f}: {nice}")
