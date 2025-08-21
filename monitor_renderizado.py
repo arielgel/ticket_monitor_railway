@@ -337,8 +337,8 @@ def cmd_list_sectors_for_show_index(idx: int):
 
             lines = [f"🧭 <b>{title}</b> — Sectores disponibles:"]
             for f in fechas:
-                # 2) Selecciono fecha → destino
-                dest = _choose_function_by_label(page, f)
+                # 2) Selecciono fecha → destino		
+				dest = _choose_function_by_label(page, f)
 				try:
 					dest.wait_for_load_state("domcontentloaded", timeout=6000)
 				except Exception:
