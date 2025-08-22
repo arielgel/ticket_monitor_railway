@@ -213,8 +213,8 @@ def _list_frames_info(page):
 
 NET_HITS_HINTS = ("seat", "seats", "zone", "zones", "map", "inventory", "section", "sections")
 
-def sniff_network_for_map(page, wait_ms=5000, max_show=2):
-    #"""Escucha respuestas que parezcan de mapa/sectores y devuelve resumenes."""
+def sniff_network_for_map(page, wait_ms=7000, max_show=5):
+    """Escucha respuestas que parezcan de mapa/sectores y devuelve resumenes."""
     hits = []
     def on_response(resp):
         try:
@@ -235,7 +235,6 @@ def sniff_network_for_map(page, wait_ms=5000, max_show=2):
             page.off("response", on_response)
         except Exception:
             pass
-    # Devolvemos los primeros max_show para no hacer ladrillo
     out = []
     for url, ct, size, status in hits[:max_show]:
         short = url if len(url) <= 200 else (url[:200] + "…")
@@ -340,6 +339,68 @@ def _open_purchase_for_date(page, label: str):
 
     # Fallback: no encontramos botón; nos quedamos en la misma página
     return page, False
+
+def _advance_to_seatmap(ctx):
+    """
+    Intenta empujar el flujo 1-2 pasos para que aparezca el mapa/leyenda.
+    No rompe si nada aparece.
+    """
+    steps = [
+        # Botones típicos intermedios
+        "button:has-text('Seleccionar ubicaciones')",
+        "a:has-text('Seleccionar ubicaciones')",
+        "button:has-text('Elegir ubicaciones')",
+        "a:has-text('Elegir ubicaciones')",
+        "button:has-text('Elegir sector')",
+        "a:has-text('Elegir sector')",
+        "button:has-text('Continuar')",
+        "a:has-text('Continuar')",
+        # A veces exigen país/idioma/edad antes de mostrar mapa
+        "button:has-text('Argentina')",
+        "button:has-text('Acepto')",
+        "button:has-text('Aceptar')",
+        "button:has-text('Entendido')",
+    ]
+    for sel in steps:
+        try:
+            btn = ctx.locator(sel).first
+            if btn and btn.count() > 0 and btn.is_visible():
+                btn.click(timeout=1800, force=True)
+                ctx.wait_for_timeout(500)
+        except Exception:
+            continue
+    # esperas suaves para que cargue lo groso
+    try:
+        ctx.wait_for_selector("svg, canvas, [class*='legend'], [data-testid*='legend']", timeout=4000)
+    except Exception:
+        pass
+
+def _frames_deep_scan(page_or_frame):
+    """
+    Devuelve un resumen de TODOS los frames accesibles:
+      - idx, url
+      - flags: has_svg/has_canvas/has_legend
+    """
+    out = []
+    try:
+        frames = page_or_frame.frames if hasattr(page_or_frame, "frames") else []
+        # incluir main frame al principio
+        if hasattr(page_or_frame, "main_frame"):
+            main = page_or_frame.main_frame
+            frames = [main] + [f for f in frames if f is not main]
+        for i, fr in enumerate(frames):
+            u = (fr.url or "").strip()
+            short = (u if len(u) <= 200 else (u[:200] + "…"))
+            try:
+                has_svg    = bool(fr.query_selector("svg"))
+                has_canvas = bool(fr.query_selector("canvas"))
+                has_legend = bool(fr.query_selector("[class*='legend'], [data-testid*='legend']"))
+                out.append(f"[{i}] svg={str(has_svg).lower()} canvas={str(has_canvas).lower()} legend={str(has_legend).lower()}  {short}")
+            except Exception:
+                out.append(f"[{i}] (cross-origin / no DOM)  {short}")
+    except Exception:
+        pass
+    return out
 
 def _get_colored_sectors_from_svg(ctx) -> list[str]:
     # ... dentro, reemplazá page.evaluate(...) por ctx.evaluate(...)
@@ -557,20 +618,20 @@ def telegram_polling():
                         region = _find_functions_region(page)
                         fechas = _gather_dates_in_region(region)
 
-                        # Intentar flujo de compra con la primera fecha (si existe)
-                        map_ctx_where = "landing"
-                        has_svg = has_canvas = has_legend = False
-                        cross_block = False
-                        net_hits = []
                         used_date = fechas[0] if fechas else None
+                        map_ctx_where = "landing"
+                        cross_block = False
+                        has_svg = has_canvas = has_legend = False
+                        net_hits = []
+                        frames_before = _list_frames_info(page)
 
                         if used_date:
                             dest, opened_new = _open_purchase_for_date(page, used_date)
-                            # Dar chance a que se cargue el sitio de compra real
-                            dest.wait_for_timeout(1000)
-                            # Oler red mientras se arma
-                            net_hits = sniff_network_for_map(dest, wait_ms=2500, max_show=3)
-                            # Ver si hay iframe con el mapa dentro de 'dest'
+                            dest.wait_for_timeout(600)  # respiro
+                            _advance_to_seatmap(dest)   # empuja 1–2 pasos
+                            # sniff de red mientras se arma el mapa
+                            net_hits = sniff_network_for_map(dest, wait_ms=7000, max_show=5)
+                            # buscar mapa en frame
                             ctx, map_ctx_where = _get_map_frame(dest)
                             try:
                                 has_svg    = bool(ctx.query_selector("svg"))
@@ -578,7 +639,9 @@ def telegram_polling():
                                 has_legend = bool(ctx.query_selector("[class*='legend'], [data-testid*='legend']"))
                             except Exception:
                                 cross_block = True
-                            # No cerramos 'dest' si es popup; lo cierra browser.close()
+                            frames_after = _frames_deep_scan(dest)
+                        else:
+                            frames_after = _frames_deep_scan(page)
 
                         soldout = page_has_soldout(page)
                         decision = "AVAILABLE_BY_DATES" if fechas else ("SOLDOUT" if soldout else "UNKNOWN")
@@ -591,8 +654,10 @@ def telegram_polling():
                         "decision_hint={decision}\n"
                         "fechas: {fechas}\n"
                         "probe_date: {probe}\n"
+                        "frames_before:\n{fb}\n"
                         "map_ctx: {where}  cross_origin_blocked={block}\n"
                         "has_svg={svg}, has_canvas={canv}, has_legend={leg}\n"
+                        "frames_after:\n{fa}\n"
                         "net_hits:\n{hits}\n"
                         "{sign}".format(
                             title=title,
@@ -600,11 +665,13 @@ def telegram_polling():
                             decision=decision,
                             fechas=", ".join(fechas) if fechas else "-",
                             probe=used_date or "-",
+                            fb=("\n".join(frames_before) if frames_before else "(sin iframes)"),
                             where=map_ctx_where,
                             block=str(cross_block).lower(),
                             svg=str(has_svg).lower(),
                             canv=str(has_canvas).lower(),
                             leg=str(has_legend).lower(),
+                            fa=("\n".join(frames_after) if frames_after else "(sin iframes)"),
                             hits=("\n".join("• "+h for h in net_hits) if net_hits else "(sin coincidencias)"),
                             sign=SIGN
                         ),
