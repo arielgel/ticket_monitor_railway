@@ -501,7 +501,7 @@ def telegram_polling():
                         force=True
                     )
 
-                 elif tlow.startswith("/sectores"):
+                elif tlow.startswith("/sectores"):
                     m = re.match(r"^/sectores\s+(\d+)\s*$", tlow)
                     if not m:
                         tg_send(f"Usá: /sectores N (ej: /sectores 2){SIGN}", force=True)
