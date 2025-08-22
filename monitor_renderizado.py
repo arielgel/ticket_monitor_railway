@@ -321,9 +321,9 @@ def _open_purchase_for_date(page, label: str):
     """
     Selecciona la fecha 'label' y abre la pantalla de compra.
     Devuelve (dest, opened_new, nav_info) donde:
-      - dest: page o popup,
+      - dest: page o popup (o la misma page si abre modal),
       - opened_new: bool,
-      - nav_info: texto con 'from → to' o 'no-change'.
+      - nav_info: texto 'from → to' o 'modal' o 'no-change'.
     """
     _dismiss_banners(page)
     _choose_function_by_label(page, label)
@@ -335,16 +335,21 @@ def _open_purchase_for_date(page, label: str):
         "button:has-text('Continuar')", "a:has-text('Continuar')",
         "button:has-text('Comprar')", "a:has-text('Comprar')",
         "a:has-text('Comprar entradas')",
+        "button:has-text('Seleccionar ubicaciones')", "a:has-text('Seleccionar ubicaciones')",
     ]
 
-    # 1) Intenta navegar en la MISMA pestaña
+    # Escuchar red desde antes por si el proveedor pega JSON al click
+    # (no usamos el resultado acá; se usa en /debug, pero dejamos el hook colocado)
+    # El sniffer real se instala en /debug; acá solo intentamos abrir la compra.
+
+    # 1) Misma pestaña (navegación real)
     for sel in triggers:
         try:
             _dismiss_banners(page)
             btn = page.locator(sel).first
-            if btn and btn.count()>0:
+            if btn and btn.count() > 0:
                 btn.scroll_into_view_if_needed(timeout=2000)
-                with page.expect_navigation(wait_until="domcontentloaded", timeout=5000):
+                with page.expect_navigation(wait_until="domcontentloaded", timeout=4000):
                     btn.click(timeout=2000, force=True)
                 after = page.url
                 page.wait_for_load_state("networkidle", timeout=5000)
@@ -353,24 +358,43 @@ def _open_purchase_for_date(page, label: str):
         except Exception:
             continue
 
-    # 2) Si no navegó, intenta POPUP
+    # 2) Popup
     for sel in triggers:
         try:
             _dismiss_banners(page)
             btn = page.locator(sel).first
-            if btn and btn.count()>0:
+            if btn and btn.count() > 0:
                 btn.scroll_into_view_if_needed(timeout=2000)
                 with page.expect_popup() as pinfo:
                     btn.click(timeout=2000, force=True)
                 popup = pinfo.value
                 try: popup.wait_for_load_state("domcontentloaded", timeout=6000)
                 except Exception: pass
-                after = popup.url
-                return popup, True, f"{before} → {after} (popup)"
+                return popup, True, f"{before} → {popup.url} (popup)"
         except Exception:
             continue
 
-    # 3) Fallback: sin navegación visible
+    # 3) Modal en la misma página (SPA): click forzado y chequeo de diálogo/iframe
+    for sel in triggers:
+        try:
+            ok = _force_click_js(page, sel)
+            if ok:
+                page.wait_for_timeout(600)
+                modal = _get_modal_root(page)
+                if modal:
+                    # Buscar iframe dentro del modal
+                    try:
+                        ifr = page.locator("[role='dialog'] iframe, .MuiDialog-paper iframe, .modal iframe").first
+                        if ifr and ifr.count() > 0:
+                            # Si hay iframe, devolvemos page (el ctx lo elegiremos luego con _get_map_frame)
+                            return page, False, "modal+iframe"
+                    except Exception:
+                        pass
+                    return page, False, "modal"
+                # si no hay modal visible, igual puede haber inyectado contenido
+        except Exception:
+            continue
+
     return page, False, "no-change"
 
 def _click_candidates(ctx, selectors, pause_ms=500):
@@ -389,6 +413,43 @@ def _click_candidates(ctx, selectors, pause_ms=500):
         except Exception:
             continue
     return False
+
+def _force_click_js(ctx, selector):
+    """Click via JS cuando el click normal no dispara nada (SPAs, overlays)."""
+    try:
+        ctx.evaluate(
+            """(sel) => {
+                const el = document.querySelector(sel);
+                if (!el) return false;
+                el.scrollIntoView({block:'center', inline:'center'});
+                el.click();
+                const evt = new MouseEvent('click', {bubbles:true, cancelable:true, view:window});
+                el.dispatchEvent(evt);
+                return true;
+            }""",
+            selector
+        )
+        ctx.wait_for_timeout(300)
+        return True
+    except Exception:
+        return False
+
+def _get_modal_root(ctx):
+    """Devuelve el root de un diálogo/modal si aparece, o None si no hay."""
+    for sel in [
+        "[role='dialog']",
+        ".MuiDialog-paper",
+        ".modal:visible",
+        ".ReactModal__Content",
+        "[class*='Dialog'] [class*='paper']",
+    ]:
+        try:
+            node = ctx.locator(sel).first
+            if node and node.count() > 0 and node.is_visible():
+                return node
+        except Exception:
+            continue
+    return None
 
 def _advance_to_seatmap(ctx):
     """
@@ -669,43 +730,53 @@ def telegram_polling():
                         fechas = _gather_dates_in_region(region)
                         used_date = fechas[0] if fechas else None
 
-                        landing_buttons = []
-                        try:
-                            btns = page.query_selector_all("button, a")
-                            for b in btns[:300]:
-                                try:
-                                    t = (b.inner_text() or "").strip()
-                                except Exception:
-                                    t = ""
-                                if t and any(k in t.lower() for k in ["mapa","sector","ubicaci","comprar","continuar","entradas","ver mapa","elegir"]):
-                                    landing_buttons.append(t if len(t)<=80 else t[:80]+"…")
-                            landing_buttons = sorted(set(landing_buttons), key=str.lower)[:20]
-                        except Exception:
-                            pass
+                        # Botones candidatos visibles en landing
+                        def list_buttons(ctx):
+                            out = []
+                            try:
+                                btns = ctx.query_selector_all("button, a")
+                                for b in btns[:300]:
+                                    try: t = (b.inner_text() or "").strip()
+                                    except Exception: t = ""
+                                    if t and any(k in t.lower() for k in ["mapa","sector","ubicaci","comprar","continuar","entradas","ver mapa","elegir"]):
+                                        out.append(t if len(t)<=80 else t[:80]+"…")
+                                return sorted(set(out), key=str.lower)[:20]
+                            except Exception:
+                                return []
+                        landing_buttons = list_buttons(page)
 
                         frames_before = _list_frames_info(page)
-
-                        map_ctx_where = "landing"
+                        nav_info = "skip"
+                        modal_flag = "no"
+                        ctx_where = "landing"
                         cross_block = False
                         has_svg = has_canvas = has_legend = False
                         net_hits = []
-                        nav_info = "skip"
+                        frames_after = []
 
                         if used_date:
                             dest, opened_new, nav_info = _open_purchase_for_date(page, used_date)
-                            dest.wait_for_timeout(800)
-                            _advance_to_seatmap(dest)
-                            # Sniff extendido
-                            net_hits = sniff_network_for_map(dest, wait_ms=12000, max_show=8)
-                            # Buscar mapa/leyenda
-                            ctx, map_ctx_where = _get_map_frame(dest)
+                            # ¿apareció modal?
+                            modal = _get_modal_root(dest if not opened_new else dest) if not opened_new else None
+                            if modal: modal_flag = "yes"
+                            (dest if not opened_new else dest).wait_for_timeout(800)
+
+                            # Empujar 1–2 pasos
+                            _advance_to_seatmap(dest if not opened_new else dest)
+
+                            # Sniff extendido (12s)
+                            net_hits = sniff_network_for_map(dest if not opened_new else dest, wait_ms=12000, max_show=8)
+
+                            # Seleccionar contexto (iframe o page) para buscar mapa/leyenda
+                            ctx, ctx_where = _get_map_frame(dest if not opened_new else dest)
                             try:
                                 has_svg    = bool(ctx.query_selector("svg"))
                                 has_canvas = bool(ctx.query_selector("canvas"))
                                 has_legend = bool(ctx.query_selector("[class*='legend'], [data-testid*='legend']"))
                             except Exception:
                                 cross_block = True
-                            frames_after = _frames_deep_scan(dest)
+
+                            frames_after = _frames_deep_scan(dest if not opened_new else dest)
                         else:
                             frames_after = _frames_deep_scan(page)
 
@@ -722,6 +793,7 @@ def telegram_polling():
                         "probe_date: {probe}\n"
                         "landing_buttons: {btns}\n"
                         "nav: {nav}\n"
+                        "modal: {modal}\n"
                         "frames_before:\n{fb}\n"
                         "map_ctx: {where}  cross_origin_blocked={block}\n"
                         "has_svg={svg}, has_canvas={canv}, has_legend={leg}\n"
@@ -735,8 +807,9 @@ def telegram_polling():
                             probe=used_date or "-",
                             btns=", ".join(landing_buttons) if landing_buttons else "-",
                             nav=nav_info,
+                            modal=modal_flag,
                             fb=("\n".join(frames_before) if frames_before else "(sin iframes)"),
-                            where=map_ctx_where,
+                            where=ctx_where,
                             block=str(cross_block).lower(),
                             svg=str(has_svg).lower(),
                             canv=str(has_canvas).lower(),
