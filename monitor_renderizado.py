@@ -165,15 +165,38 @@ def _open_map_if_any(page):
         try:
             btn = page.locator(sel).first
             if btn and btn.count() > 0 and btn.is_visible():
-                btn.click(timeout=1500, force=True)
-                page.wait_for_timeout(400)
+                btn.click(timeout=1800, force=True)
+                page.wait_for_timeout(500)
         except Exception:
             continue
-    # no fallamos si no aparece; solo intentamos
+    # Esperas suaves: primero popover/modal, luego svg/canvas/legend
     try:
-        page.wait_for_selector("svg", timeout=3000)
+        page.wait_for_timeout(500)
+        page.wait_for_selector("svg, canvas, [class*='legend'], [data-testid*='legend']", timeout=4000)
     except Exception:
         pass
+
+def _get_map_frame(page):
+    """
+    Devuelve (frame, where) donde buscar el mapa. Si no hay iframe, devuelve (page, "page").
+    """
+    try:
+        # Heurística: iframes con mapa/seat/zone
+        frames = [f for f in page.frames if f != page.main_frame]
+        for fr in frames:
+            url = (fr.url or "").lower()
+            if any(k in url for k in ["seat", "map", "zone", "inventory", "ticket"]):
+                return fr, "iframe-url"
+        # Si no matchea por URL, probamos contenido
+        for fr in frames:
+            try:
+                if fr.query_selector("svg") or fr.query_selector("canvas") or fr.query_selector("[class*='legend']"):
+                    return fr, "iframe-dom"
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return page, "page"
 
 def _choose_function_by_label(page, label: str):
     #"""Intenta clickear la fecha/función con cierto texto."""
@@ -234,7 +257,8 @@ def _choose_function_by_label(page, label: str):
         pass
     return False
 
-def _get_colored_sectors_from_svg(page) -> list[str]:
+def _get_colored_sectors_from_svg(ctx) -> list[str]:
+    # ... dentro, reemplazá page.evaluate(...) por ctx.evaluate(...)
     try:
         labels = page.evaluate("""
         () => {
@@ -303,6 +327,32 @@ def _get_colored_sectors_from_svg(page) -> list[str]:
             if s:
                 cleaned.append(s)
         return cleaned
+    except Exception:
+        return []
+
+def _get_sectors_from_legend(ctx) -> list[str]:
+    """
+    Cuando no hay SVG, algunas integraciones muestran una leyenda/lista con sectores activos.
+    """
+    try:
+        items = ctx.query_selector_all("[class*='legend'] li, .legend li, [data-testid*='legend'] li, [role='list'] [role='listitem']")
+        out = []
+        for it in items[:200]:
+            try:
+                txt = (it.inner_text() or "").strip()
+            except Exception:
+                txt = ""
+            if not txt:
+                continue
+            low = txt.lower()
+            if any(k in low for k in ["agotado", "sold out", "sin disponibilidad", "no disponible"]):
+                continue
+            # limpiamos contadores "(123)"
+            txt = re.sub(r"\(\d{1,4}\)", "", txt).strip(" -—–\t")
+            if txt:
+                out.append(txt)
+        # únicos, orden alfabético
+        return sorted(set(out), key=lambda s: s.lower())[:80]
     except Exception:
         return []
 
@@ -402,10 +452,14 @@ def telegram_polling():
                 elif tlow.startswith("/debug"):
                     m = re.match(r"^/debug\s+(\d+)\s*$", tlow)
                     if not m:
-                        tg_send(f"Usá: /debug N (ej: /debug 2){SIGN}", force=True); continue
+                        tg_send(f"Usá: /debug N (ej: /debug 2){SIGN}", force=True)
+                        continue
+
                     idx = int(m.group(1))
                     if not (1 <= idx <= len(URLS)):
-                        tg_send(f"Índice fuera de rango (1–{len(URLS)}).{SIGN}", force=True); continue
+                        tg_send(f"Índice fuera de rango (1–{len(URLS)}).{SIGN}", force=True)
+                        continue
+
                     url = URLS[idx-1]
                     with sync_playwright() as p:
                         browser = p.chromium.launch(headless=True)
@@ -413,21 +467,41 @@ def telegram_polling():
                         page.goto(url, timeout=60000)
                         page.wait_for_load_state("networkidle", timeout=15000)
                         title = extract_title(page) or prettify_from_slug(url)
+
                         _open_dropdown_if_any(page)
                         region = _find_functions_region(page)
                         pre = _gather_dates_in_region(region)
-                        post = pre[:]
+
+                        # === Nuevo: test de mapa ===
+                        _open_map_if_any(page)
+                        ctx, where = _get_map_frame(page)
+
+                        has_svg   = bool(ctx.query_selector("svg"))
+                        has_canvas= bool(ctx.query_selector("canvas"))
+                        has_legend= bool(ctx.query_selector("[class*='legend'], [data-testid*='legend']"))
+
+                        sectors_svg    = _get_colored_sectors_from_svg(ctx)
+                        sectors_legend = _get_sectors_from_legend(ctx)
+
                         soldout = page_has_soldout(page)
-                        decision = "AVAILABLE_BY_DATES" if (pre or post) else ("SOLDOUT" if soldout else "UNKNOWN")
+                        decision = "AVAILABLE_BY_DATES" if pre else ("SOLDOUT" if soldout else "UNKNOWN")
+
                         browser.close()
+
                     tg_send(
-                        f"🧪 DEBUG — {title}\nURL idx {idx}\n"
-                        f"decision_hint={decision}\npre: {', '.join(pre) if pre else '-'}\n"
-                        f"post: {', '.join(post) if post else '-'}\n{SIGN}",
+                        f"🧪 DEBUG — {title}\n"
+                        f"URL idx {idx}\n"
+                        f"decision_hint={decision}\n"
+                        f"fechas: {', '.join(pre) if pre else '-'}\n"
+                        f"map_ctx: {where}\n"
+                        f"has_svg={has_svg}, has_canvas={has_canvas}, has_legend={has_legend}\n"
+                        f"svg_detected: {', '.join(sectors_svg) if sectors_svg else '-'}\n"
+                        f"legend_detected: {', '.join(sectors_legend) if sectors_legend else '-'}\n"
+                        f"{SIGN}",
                         force=True
                     )
 
-                elif tlow.startswith("/sectores"):
+                 elif tlow.startswith("/sectores"):
                     m = re.match(r"^/sectores\s+(\d+)\s*$", tlow)
                     if not m:
                         tg_send(f"Usá: /sectores N (ej: /sectores 2){SIGN}", force=True)
@@ -446,7 +520,6 @@ def telegram_polling():
                         page.wait_for_load_state("networkidle", timeout=15000)
                         title = extract_title(page) or prettify_from_slug(url)
 
-                        # Fechas visibles
                         _open_dropdown_if_any(page)
                         region = _find_functions_region(page)
                         fechas = _gather_dates_in_region(region)
@@ -456,22 +529,26 @@ def telegram_polling():
                             lines.append("(sin sectores)")
                         else:
                             for f in fechas:
-                                # elegir fecha y abrir mapa
                                 _choose_function_by_label(page, f)
                                 _open_map_if_any(page)
-                                # leer sectores coloreados
-                                sectors = _get_colored_sectors_from_svg(page)
+
+                                # ¿mapa en iframe?
+                                ctx, where = _get_map_frame(page)
+
+                                # primero intentamos SVG coloreado
+                                sectors = _get_colored_sectors_from_svg(ctx)
+                                if not sectors:
+                                    # probamos leyenda/lista
+                                    sectors = _get_sectors_from_legend(ctx)
+
                                 if sectors:
-                                    # Mostramos hasta 12 para no hacer chorizo
                                     top = ", ".join(sectors[:12])
                                     lines.append(f"{f}: {top}")
                                 else:
                                     lines.append(f"{f}: (sin sectores)")
 
-                        try:
-                            browser.close()
-                        except Exception:
-                            pass
+                        try: browser.close()
+                        except Exception: pass
 
                     tg_send("\n".join(lines) + f"\n{SIGN}", force=True)
 
