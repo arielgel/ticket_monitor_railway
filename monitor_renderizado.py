@@ -321,9 +321,9 @@ def _open_purchase_for_date(page, label: str):
     """
     Selecciona la fecha 'label' y abre la pantalla de compra.
     Devuelve (dest, opened_new, nav_info) donde:
-      - dest: page o popup (o la misma page si abre modal),
+      - dest: page o popup (o la misma page si es SPA),
       - opened_new: bool,
-      - nav_info: texto 'from → to' o 'modal' o 'no-change'.
+      - nav_info: 'from → to' | 'modal' | 'no-change' | 'scrolled-buy'.
     """
     _dismiss_banners(page)
     _choose_function_by_label(page, label)
@@ -338,11 +338,7 @@ def _open_purchase_for_date(page, label: str):
         "button:has-text('Seleccionar ubicaciones')", "a:has-text('Seleccionar ubicaciones')",
     ]
 
-    # Escuchar red desde antes por si el proveedor pega JSON al click
-    # (no usamos el resultado acá; se usa en /debug, pero dejamos el hook colocado)
-    # El sniffer real se instala en /debug; acá solo intentamos abrir la compra.
-
-    # 1) Misma pestaña (navegación real)
+    # 1) Intentar navegación en la MISMA pestaña
     for sel in triggers:
         try:
             _dismiss_banners(page)
@@ -358,7 +354,7 @@ def _open_purchase_for_date(page, label: str):
         except Exception:
             continue
 
-    # 2) Popup
+    # 2) Intentar POPUP
     for sel in triggers:
         try:
             _dismiss_banners(page)
@@ -368,33 +364,104 @@ def _open_purchase_for_date(page, label: str):
                 with page.expect_popup() as pinfo:
                     btn.click(timeout=2000, force=True)
                 popup = pinfo.value
-                try: popup.wait_for_load_state("domcontentloaded", timeout=6000)
-                except Exception: pass
+                try:
+                    popup.wait_for_load_state("domcontentloaded", timeout=6000)
+                except Exception:
+                    pass
                 return popup, True, f"{before} → {popup.url} (popup)"
         except Exception:
             continue
 
-    # 3) Modal en la misma página (SPA): click forzado y chequeo de diálogo/iframe
+    # 3) SPA: click forzado por JS y SCROLL profundo buscando el "comprar" real en cards
+    #    (sin romper si no existe)
     for sel in triggers:
         try:
-            ok = _force_click_js(page, sel)
-            if ok:
+            if _force_click_js(page, sel):
                 page.wait_for_timeout(600)
-                modal = _get_modal_root(page)
-                if modal:
-                    # Buscar iframe dentro del modal
+                # scroll progresivo por si solo hizo anchor a #tickets
+                try:
+                    page.evaluate("""
+                        () => new Promise(res => {
+                            let y = 0, max = document.body.scrollHeight, step = 600;
+                            function sc() {
+                                window.scrollTo(0, y);
+                                y += step;
+                                if (y < max) setTimeout(sc, 60); else setTimeout(res, 200);
+                            }
+                            sc();
+                        })
+                    """)
+                except Exception:
+                    pass
+                page.wait_for_timeout(400)
+
+                # buscar botones de compra visibles en toda la página
+                candidates = []
+                try:
+                    btns = page.query_selector_all("button, a")
+                    for b in btns[:600]:
+                        try:
+                            txt = (b.inner_text() or "").strip()
+                        except Exception:
+                            txt = ""
+                        if not txt:
+                            continue
+                        low = txt.lower()
+                        if any(k in low for k in ["comprar", "comprar entradas", "continuar", "elegir ubicaciones", "ver mapa"]):
+                            try:
+                                vis = b.is_visible()
+                            except Exception:
+                                vis = False
+                            if vis:
+                                candidates.append(b)
+                except Exception:
+                    candidates = []
+
+                # preferí 'comprar' sobre 'continuar'
+                def weight(btn):
                     try:
-                        ifr = page.locator("[role='dialog'] iframe, .MuiDialog-paper iframe, .modal iframe").first
-                        if ifr and ifr.count() > 0:
-                            # Si hay iframe, devolvemos page (el ctx lo elegiremos luego con _get_map_frame)
-                            return page, False, "modal+iframe"
+                        t = (btn.inner_text() or "").lower()
                     except Exception:
-                        pass
-                    return page, False, "modal"
-                # si no hay modal visible, igual puede haber inyectado contenido
+                        t = ""
+                    if "comprar" in t:
+                        return 0
+                    if "continuar" in t:
+                        return 1
+                    return 2
+
+                candidates = sorted(candidates, key=weight)
+
+                # intentá clickear el mejor candidato que no sea el mismo de arriba
+                for b in candidates[:10]:
+                    try:
+                        # intentamos navegación o popup desde este botón
+                        with page.expect_navigation(wait_until="domcontentloaded", timeout=3000):
+                            b.click(timeout=2000, force=True)
+                        after = page.url
+                        page.wait_for_load_state("networkidle", timeout=4000)
+                        if after != before:
+                            return page, False, f"{before} → {after} (scrolled-buy)"
+                    except Exception:
+                        # intentar popup
+                        try:
+                            with page.expect_popup() as pinfo:
+                                b.click(timeout=2000, force=True)
+                            popup = pinfo.value
+                            try:
+                                popup.wait_for_load_state("domcontentloaded", timeout=5000)
+                            except Exception:
+                                pass
+                            return popup, True, f"{before} → {popup.url} (scrolled-buy popup)"
+                        except Exception:
+                            continue
+
+                # si llegamos acá, no hubo navegación visible
+                return page, False, "scrolled-buy"
+
         except Exception:
             continue
 
+    # 4) Nada cambió
     return page, False, "no-change"
 
 def _click_candidates(ctx, selectors, pause_ms=500):
@@ -730,7 +797,7 @@ def telegram_polling():
                         fechas = _gather_dates_in_region(region)
                         used_date = fechas[0] if fechas else None
 
-                        # Botones candidatos visibles en landing
+                        # botones visibles en landing
                         def list_buttons(ctx):
                             out = []
                             try:
@@ -744,38 +811,27 @@ def telegram_polling():
                             except Exception:
                                 return []
                         landing_buttons = list_buttons(page)
-
                         frames_before = _list_frames_info(page)
-                        nav_info = "skip"
-                        modal_flag = "no"
-                        ctx_where = "landing"
+
+                        map_ctx_where = "landing"
                         cross_block = False
                         has_svg = has_canvas = has_legend = False
                         net_hits = []
                         frames_after = []
+                        nav_info = "skip"
 
                         if used_date:
                             dest, opened_new, nav_info = _open_purchase_for_date(page, used_date)
-                            # ¿apareció modal?
-                            modal = _get_modal_root(dest if not opened_new else dest) if not opened_new else None
-                            if modal: modal_flag = "yes"
-                            (dest if not opened_new else dest).wait_for_timeout(800)
-
-                            # Empujar 1–2 pasos
-                            _advance_to_seatmap(dest if not opened_new else dest)
-
-                            # Sniff extendido (12s)
+                            # sniff extendido
                             net_hits = sniff_network_for_map(dest if not opened_new else dest, wait_ms=12000, max_show=8)
-
-                            # Seleccionar contexto (iframe o page) para buscar mapa/leyenda
-                            ctx, ctx_where = _get_map_frame(dest if not opened_new else dest)
+                            # buscar mapa
+                            ctx, map_ctx_where = _get_map_frame(dest if not opened_new else dest)
                             try:
                                 has_svg    = bool(ctx.query_selector("svg"))
                                 has_canvas = bool(ctx.query_selector("canvas"))
                                 has_legend = bool(ctx.query_selector("[class*='legend'], [data-testid*='legend']"))
                             except Exception:
                                 cross_block = True
-
                             frames_after = _frames_deep_scan(dest if not opened_new else dest)
                         else:
                             frames_after = _frames_deep_scan(page)
@@ -793,7 +849,6 @@ def telegram_polling():
                         "probe_date: {probe}\n"
                         "landing_buttons: {btns}\n"
                         "nav: {nav}\n"
-                        "modal: {modal}\n"
                         "frames_before:\n{fb}\n"
                         "map_ctx: {where}  cross_origin_blocked={block}\n"
                         "has_svg={svg}, has_canvas={canv}, has_legend={leg}\n"
@@ -807,9 +862,8 @@ def telegram_polling():
                             probe=used_date or "-",
                             btns=", ".join(landing_buttons) if landing_buttons else "-",
                             nav=nav_info,
-                            modal=modal_flag,
                             fb=("\n".join(frames_before) if frames_before else "(sin iframes)"),
-                            where=ctx_where,
+                            where=map_ctx_where,
                             block=str(cross_block).lower(),
                             svg=str(has_svg).lower(),
                             canv=str(has_canvas).lower(),
