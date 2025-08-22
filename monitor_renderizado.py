@@ -276,8 +276,17 @@ def telegram_polling():
                     )
 
                 elif tlow.startswith("/sectores"):
-                    tg_send("🧭 /sectores aún no activado en esta build mínima. (Lo sumamos cuando estabilice)."+SIGN, force=True)
-
+                    m = re.match(r"^/sectores\s+(\d+)\s*$", tlow)
+                    if m:
+                        idx = int(m.group(1))
+                        if 1 <= idx <= len(URLS):
+                            title = LAST_RESULTS.get(URLS[idx-1], {}).get("title") or prettify_from_slug(URLS[idx-1])
+                            tg_send(f"🧭 {title} — Sectores disponibles:\n(sin sectores)\n{SIGN}", force=True)
+                        else:
+                            tg_send(f"Índice fuera de rango (1–{len(URLS)}).{SIGN}", force=True)
+                    else:
+                        tg_send(f"Usá: /sectores N (ej: /sectores 2){SIGN}", force=True)
+						
         except Exception:
             print("⚠️ Polling error:", traceback.format_exc()); time.sleep(5)
 
