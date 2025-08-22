@@ -213,8 +213,8 @@ def _list_frames_info(page):
 
 NET_HITS_HINTS = ("seat", "seats", "zone", "zones", "map", "inventory", "section", "sections")
 
-def sniff_network_for_map(page, wait_ms=7000, max_show=5):
-    """Escucha respuestas que parezcan de mapa/sectores y devuelve resumenes."""
+def sniff_network_for_map(page, wait_ms=12000, max_show=8):
+    """Escucha respuestas que parezcan de mapa/sectores y devuelve resúmenes."""
     hits = []
     def on_response(resp):
         try:
@@ -340,38 +340,55 @@ def _open_purchase_for_date(page, label: str):
     # Fallback: no encontramos botón; nos quedamos en la misma página
     return page, False
 
-def _advance_to_seatmap(ctx):
+def _click_candidates(ctx, selectors, pause_ms=500):
     """
-    Intenta empujar el flujo 1-2 pasos para que aparezca el mapa/leyenda.
-    No rompe si nada aparece.
+    Intenta clickear cualquier selector visible de la lista, en orden.
+    Retorna True si clickeó algo.
     """
-    steps = [
-        # Botones típicos intermedios
-        "button:has-text('Seleccionar ubicaciones')",
-        "a:has-text('Seleccionar ubicaciones')",
-        "button:has-text('Elegir ubicaciones')",
-        "a:has-text('Elegir ubicaciones')",
-        "button:has-text('Elegir sector')",
-        "a:has-text('Elegir sector')",
-        "button:has-text('Continuar')",
-        "a:has-text('Continuar')",
-        # A veces exigen país/idioma/edad antes de mostrar mapa
-        "button:has-text('Argentina')",
-        "button:has-text('Acepto')",
-        "button:has-text('Aceptar')",
-        "button:has-text('Entendido')",
-    ]
-    for sel in steps:
+    for sel in selectors:
         try:
             btn = ctx.locator(sel).first
             if btn and btn.count() > 0 and btn.is_visible():
-                btn.click(timeout=1800, force=True)
-                ctx.wait_for_timeout(500)
+                btn.scroll_into_view_if_needed(timeout=1500)
+                btn.click(timeout=2000, force=True)
+                ctx.wait_for_timeout(pause_ms)
+                return True
         except Exception:
             continue
-    # esperas suaves para que cargue lo groso
+    return False
+
+def _advance_to_seatmap(ctx):
+    """
+    Empuja el flujo 2–3 pasos típicos hasta que aparezca el mapa o leyenda.
+    No falla si nada aparece.
+    """
+    waves = [
+        [
+            "button:has-text('Seleccionar ubicaciones')", "a:has-text('Seleccionar ubicaciones')",
+            "button:has-text('Elegir ubicaciones')", "a:has-text('Elegir ubicaciones')",
+            "button:has-text('Elegir sector')", "a:has-text('Elegir sector')",
+            "button:has-text('Ver mapa')", "a:has-text('Ver mapa')",
+            "button:has-text('Mapa')", "a:has-text('Mapa')",
+            "button:has-text('Continuar')", "a:has-text('Continuar')",
+            "button:has-text('Comprar')", "a:has-text('Comprar')",
+        ],
+        [
+            # Popups o confirmaciones frecuentes
+            "button:has-text('Aceptar')", "button:has-text('Acepto')",
+            "button:has-text('Entendido')", "button:has-text('Estoy de acuerdo')",
+            "button:has-text('Argentina')", "button:has-text('Español')",
+        ],
+    ]
+    for wave in waves:
+        _click_candidates(ctx, wave, pause_ms=700)
+        try:
+            ctx.wait_for_selector("svg, canvas, [class*='legend'], [data-testid*='legend']", timeout=3500)
+            break
+        except Exception:
+            pass
+    # Espera adicional suave (por si el proveedor tarda)
     try:
-        ctx.wait_for_selector("svg, canvas, [class*='legend'], [data-testid*='legend']", timeout=4000)
+        ctx.wait_for_timeout(800)
     except Exception:
         pass
 
@@ -617,21 +634,44 @@ def telegram_polling():
                         _open_dropdown_if_any(page)
                         region = _find_functions_region(page)
                         fechas = _gather_dates_in_region(region)
-
                         used_date = fechas[0] if fechas else None
+
+                        # Lista de botones candidatos visibles (landing)
+                        def list_buttons(ctx):
+                            out = []
+                            try:
+                                btns = ctx.query_selector_all("button, a")
+                                for b in btns[:300]:
+                                    try:
+                                        t = (b.inner_text() or "").strip()
+                                    except Exception:
+                                        t = ""
+                                    if t:
+                                        low = t.lower()
+                                        if any(k in low for k in ["mapa","sector","ubicaci","comprar","continuar","entradas","ver mapa","elegir"]):
+                                            if len(t) > 80: t = t[:80] + "…"
+                                            out.append(t)
+                                return sorted(set(out), key=lambda s: s.lower())[:20]
+                            except Exception:
+                                return []
+                        landing_buttons = list_buttons(page)
+
+                        # Intentar flujo de compra con la primera fecha
                         map_ctx_where = "landing"
                         cross_block = False
                         has_svg = has_canvas = has_legend = False
                         net_hits = []
                         frames_before = _list_frames_info(page)
+                        frames_after  = []
 
                         if used_date:
                             dest, opened_new = _open_purchase_for_date(page, used_date)
-                            dest.wait_for_timeout(600)  # respiro
-                            _advance_to_seatmap(dest)   # empuja 1–2 pasos
-                            # sniff de red mientras se arma el mapa
-                            net_hits = sniff_network_for_map(dest, wait_ms=7000, max_show=5)
-                            # buscar mapa en frame
+                            dest.wait_for_timeout(800)
+                            # Empujar 2–3 pasos más
+                            _advance_to_seatmap(dest)
+                            # Sniff extendido
+                            net_hits = sniff_network_for_map(dest, wait_ms=12000, max_show=8)
+                            # Buscar mapa/leyenda
                             ctx, map_ctx_where = _get_map_frame(dest)
                             try:
                                 has_svg    = bool(ctx.query_selector("svg"))
@@ -640,8 +680,6 @@ def telegram_polling():
                             except Exception:
                                 cross_block = True
                             frames_after = _frames_deep_scan(dest)
-                        else:
-                            frames_after = _frames_deep_scan(page)
 
                         soldout = page_has_soldout(page)
                         decision = "AVAILABLE_BY_DATES" if fechas else ("SOLDOUT" if soldout else "UNKNOWN")
@@ -654,6 +692,7 @@ def telegram_polling():
                         "decision_hint={decision}\n"
                         "fechas: {fechas}\n"
                         "probe_date: {probe}\n"
+                        "landing_buttons: {btns}\n"
                         "frames_before:\n{fb}\n"
                         "map_ctx: {where}  cross_origin_blocked={block}\n"
                         "has_svg={svg}, has_canvas={canv}, has_legend={leg}\n"
@@ -665,6 +704,7 @@ def telegram_polling():
                             decision=decision,
                             fechas=", ".join(fechas) if fechas else "-",
                             probe=used_date or "-",
+                            btns=", ".join(landing_buttons) if landing_buttons else "-",
                             fb=("\n".join(frames_before) if frames_before else "(sin iframes)"),
                             where=map_ctx_where,
                             block=str(cross_block).lower(),
