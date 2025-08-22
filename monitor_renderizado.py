@@ -301,6 +301,46 @@ def _choose_function_by_label(page, label: str):
         pass
     return False
 
+def _open_purchase_for_date(page, label: str):
+    """
+    Selecciona la fecha 'label', y luego intenta abrir la pantalla de compra.
+    Devuelve (dest, opened_new) donde dest es page o popup, y opened_new indica si abrió nueva pestaña.
+    """
+    _choose_function_by_label(page, label)
+    page.wait_for_timeout(250)
+
+    # Botón "Ver entradas" o similar: a veces navega en la misma pestaña, a veces abre popup.
+    triggers = [
+        "button:has-text('Ver entradas')", "a:has-text('Ver entradas')",
+        "button:has-text('Comprar')", "a:has-text('Comprar')",
+        "button:has-text('Continuar')", "a:has-text('Continuar')",
+    ]
+
+    for sel in triggers:
+        try:
+            btn = page.locator(sel).first
+            if btn and btn.count() > 0 and btn.is_visible():
+                # Intentar capturar popup si lo hay
+                try:
+                    with page.expect_popup() as pinfo:
+                        btn.click(timeout=2000, force=True)
+                    popup = pinfo.value
+                    # darle tiempo a que cargue
+                    try: popup.wait_for_load_state("domcontentloaded", timeout=6000)
+                    except Exception: pass
+                    return popup, True
+                except Exception:
+                    # si no hubo popup, asumimos navegación en la misma pestaña
+                    btn.click(timeout=2000, force=True)
+                    try: page.wait_for_load_state("domcontentloaded", timeout=6000)
+                    except Exception: pass
+                    return page, False
+        except Exception:
+            continue
+
+    # Fallback: no encontramos botón; nos quedamos en la misma página
+    return page, False
+
 def _get_colored_sectors_from_svg(ctx) -> list[str]:
     # ... dentro, reemplazá page.evaluate(...) por ctx.evaluate(...)
     try:
@@ -512,29 +552,33 @@ def telegram_polling():
                         page.wait_for_load_state("networkidle", timeout=15000)
                         title = extract_title(page) or prettify_from_slug(url)
 
+                        # Fechas en la landing
                         _open_dropdown_if_any(page)
                         region = _find_functions_region(page)
                         fechas = _gather_dates_in_region(region)
 
-                        # Intentar abrir algo de mapa por si aparece inline
-                        _open_map_if_any(page)
-
-                        # Info de frames
-                        frames_info = _list_frames_info(page)
-                        ctx, where = _get_map_frame(page)
-
-                        # Probar si podemos consultar dentro del ctx
-                        cross_block = False
+                        # Intentar flujo de compra con la primera fecha (si existe)
+                        map_ctx_where = "landing"
                         has_svg = has_canvas = has_legend = False
-                        try:
-                            has_svg    = bool(ctx.query_selector("svg"))
-                            has_canvas = bool(ctx.query_selector("canvas"))
-                            has_legend = bool(ctx.query_selector("[class*='legend'], [data-testid*='legend']"))
-                        except Exception:
-                            cross_block = True  # algo impide acceder al DOM del frame
+                        cross_block = False
+                        net_hits = []
+                        used_date = fechas[0] if fechas else None
 
-                        # Sniff de red (por si el mapa es canvas/app)
-                        net_hits = sniff_network_for_map(page, wait_ms=2500, max_show=2)
+                        if used_date:
+                            dest, opened_new = _open_purchase_for_date(page, used_date)
+                            # Dar chance a que se cargue el sitio de compra real
+                            dest.wait_for_timeout(1000)
+                            # Oler red mientras se arma
+                            net_hits = sniff_network_for_map(dest, wait_ms=2500, max_show=3)
+                            # Ver si hay iframe con el mapa dentro de 'dest'
+                            ctx, map_ctx_where = _get_map_frame(dest)
+                            try:
+                                has_svg    = bool(ctx.query_selector("svg"))
+                                has_canvas = bool(ctx.query_selector("canvas"))
+                                has_legend = bool(ctx.query_selector("[class*='legend'], [data-testid*='legend']"))
+                            except Exception:
+                                cross_block = True
+                            # No cerramos 'dest' si es popup; lo cierra browser.close()
 
                         soldout = page_has_soldout(page)
                         decision = "AVAILABLE_BY_DATES" if fechas else ("SOLDOUT" if soldout else "UNKNOWN")
@@ -546,7 +590,7 @@ def telegram_polling():
                         "URL idx {idx}\n"
                         "decision_hint={decision}\n"
                         "fechas: {fechas}\n"
-                        "frames:\n{frames}\n"
+                        "probe_date: {probe}\n"
                         "map_ctx: {where}  cross_origin_blocked={block}\n"
                         "has_svg={svg}, has_canvas={canv}, has_legend={leg}\n"
                         "net_hits:\n{hits}\n"
@@ -555,8 +599,8 @@ def telegram_polling():
                             idx=idx,
                             decision=decision,
                             fechas=", ".join(fechas) if fechas else "-",
-                            frames=("\n".join(frames_info) if frames_info else "(sin iframes)"),
-                            where=where,
+                            probe=used_date or "-",
+                            where=map_ctx_where,
                             block=str(cross_block).lower(),
                             svg=str(has_svg).lower(),
                             canv=str(has_canvas).lower(),
