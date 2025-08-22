@@ -300,45 +300,78 @@ def _choose_function_by_label(page, label: str):
         pass
     return False
 
-def _open_purchase_for_date(page, label: str):
-    """
-    Selecciona la fecha 'label', y luego intenta abrir la pantalla de compra.
-    Devuelve (dest, opened_new) donde dest es page o popup, y opened_new indica si abrió nueva pestaña.
-    """
-    _choose_function_by_label(page, label)
-    page.wait_for_timeout(250)
-
-    # Botón "Ver entradas" o similar: a veces navega en la misma pestaña, a veces abre popup.
-    triggers = [
-        "button:has-text('Ver entradas')", "a:has-text('Ver entradas')",
-        "button:has-text('Comprar')", "a:has-text('Comprar')",
-        "button:has-text('Continuar')", "a:has-text('Continuar')",
-    ]
-
-    for sel in triggers:
+def _dismiss_banners(ctx):
+    #"""Cierra consent/cookies/modales típicos para que no tapen los botones."""
+    for sel in [
+        "button:has-text('Aceptar')", "button:has-text('Acepto')",
+        "button:has-text('Aceptar todas')", "button:has-text('Aceptar todo')",
+        "button:has-text('Entendido')", "button:has-text('Estoy de acuerdo')",
+        "button:has-text('Cerrar')", "button[aria-label='Close']",
+        "[data-testid*='cookie'] button",
+    ]:
         try:
-            btn = page.locator(sel).first
-            if btn and btn.count() > 0 and btn.is_visible():
-                # Intentar capturar popup si lo hay
-                try:
-                    with page.expect_popup() as pinfo:
-                        btn.click(timeout=2000, force=True)
-                    popup = pinfo.value
-                    # darle tiempo a que cargue
-                    try: popup.wait_for_load_state("domcontentloaded", timeout=6000)
-                    except Exception: pass
-                    return popup, True
-                except Exception:
-                    # si no hubo popup, asumimos navegación en la misma pestaña
-                    btn.click(timeout=2000, force=True)
-                    try: page.wait_for_load_state("domcontentloaded", timeout=6000)
-                    except Exception: pass
-                    return page, False
+            b = ctx.locator(sel).first
+            if b and b.count()>0 and b.is_visible():
+                b.click(timeout=1200, force=True)
+                ctx.wait_for_timeout(250)
         except Exception:
             continue
 
-    # Fallback: no encontramos botón; nos quedamos en la misma página
-    return page, False
+def _open_purchase_for_date(page, label: str):
+    """
+    Selecciona la fecha 'label' y abre la pantalla de compra.
+    Devuelve (dest, opened_new, nav_info) donde:
+      - dest: page o popup,
+      - opened_new: bool,
+      - nav_info: texto con 'from → to' o 'no-change'.
+    """
+    _dismiss_banners(page)
+    _choose_function_by_label(page, label)
+    page.wait_for_timeout(250)
+
+    before = page.url
+    triggers = [
+        "button:has-text('Ver entradas')", "a:has-text('Ver entradas')",
+        "button:has-text('Continuar')", "a:has-text('Continuar')",
+        "button:has-text('Comprar')", "a:has-text('Comprar')",
+        "a:has-text('Comprar entradas')",
+    ]
+
+    # 1) Intenta navegar en la MISMA pestaña
+    for sel in triggers:
+        try:
+            _dismiss_banners(page)
+            btn = page.locator(sel).first
+            if btn and btn.count()>0:
+                btn.scroll_into_view_if_needed(timeout=2000)
+                with page.expect_navigation(wait_until="domcontentloaded", timeout=5000):
+                    btn.click(timeout=2000, force=True)
+                after = page.url
+                page.wait_for_load_state("networkidle", timeout=5000)
+                if after != before:
+                    return page, False, f"{before} → {after}"
+        except Exception:
+            continue
+
+    # 2) Si no navegó, intenta POPUP
+    for sel in triggers:
+        try:
+            _dismiss_banners(page)
+            btn = page.locator(sel).first
+            if btn and btn.count()>0:
+                btn.scroll_into_view_if_needed(timeout=2000)
+                with page.expect_popup() as pinfo:
+                    btn.click(timeout=2000, force=True)
+                popup = pinfo.value
+                try: popup.wait_for_load_state("domcontentloaded", timeout=6000)
+                except Exception: pass
+                after = popup.url
+                return popup, True, f"{before} → {after} (popup)"
+        except Exception:
+            continue
+
+    # 3) Fallback: sin navegación visible
+    return page, False, "no-change"
 
 def _click_candidates(ctx, selectors, pause_ms=500):
     """
@@ -630,44 +663,37 @@ def telegram_polling():
                         page.wait_for_load_state("networkidle", timeout=15000)
                         title = extract_title(page) or prettify_from_slug(url)
 
-                        # Fechas en la landing
+                        _dismiss_banners(page)
                         _open_dropdown_if_any(page)
                         region = _find_functions_region(page)
                         fechas = _gather_dates_in_region(region)
                         used_date = fechas[0] if fechas else None
 
-                        # Lista de botones candidatos visibles (landing)
-                        def list_buttons(ctx):
-                            out = []
-                            try:
-                                btns = ctx.query_selector_all("button, a")
-                                for b in btns[:300]:
-                                    try:
-                                        t = (b.inner_text() or "").strip()
-                                    except Exception:
-                                        t = ""
-                                    if t:
-                                        low = t.lower()
-                                        if any(k in low for k in ["mapa","sector","ubicaci","comprar","continuar","entradas","ver mapa","elegir"]):
-                                            if len(t) > 80: t = t[:80] + "…"
-                                            out.append(t)
-                                return sorted(set(out), key=lambda s: s.lower())[:20]
-                            except Exception:
-                                return []
-                        landing_buttons = list_buttons(page)
+                        landing_buttons = []
+                        try:
+                            btns = page.query_selector_all("button, a")
+                            for b in btns[:300]:
+                                try:
+                                    t = (b.inner_text() or "").strip()
+                                except Exception:
+                                    t = ""
+                                if t and any(k in t.lower() for k in ["mapa","sector","ubicaci","comprar","continuar","entradas","ver mapa","elegir"]):
+                                    landing_buttons.append(t if len(t)<=80 else t[:80]+"…")
+                            landing_buttons = sorted(set(landing_buttons), key=str.lower)[:20]
+                        except Exception:
+                            pass
 
-                        # Intentar flujo de compra con la primera fecha
+                        frames_before = _list_frames_info(page)
+
                         map_ctx_where = "landing"
                         cross_block = False
                         has_svg = has_canvas = has_legend = False
                         net_hits = []
-                        frames_before = _list_frames_info(page)
-                        frames_after  = []
+                        nav_info = "skip"
 
                         if used_date:
-                            dest, opened_new = _open_purchase_for_date(page, used_date)
+                            dest, opened_new, nav_info = _open_purchase_for_date(page, used_date)
                             dest.wait_for_timeout(800)
-                            # Empujar 2–3 pasos más
                             _advance_to_seatmap(dest)
                             # Sniff extendido
                             net_hits = sniff_network_for_map(dest, wait_ms=12000, max_show=8)
@@ -680,6 +706,8 @@ def telegram_polling():
                             except Exception:
                                 cross_block = True
                             frames_after = _frames_deep_scan(dest)
+                        else:
+                            frames_after = _frames_deep_scan(page)
 
                         soldout = page_has_soldout(page)
                         decision = "AVAILABLE_BY_DATES" if fechas else ("SOLDOUT" if soldout else "UNKNOWN")
@@ -693,6 +721,7 @@ def telegram_polling():
                         "fechas: {fechas}\n"
                         "probe_date: {probe}\n"
                         "landing_buttons: {btns}\n"
+                        "nav: {nav}\n"
                         "frames_before:\n{fb}\n"
                         "map_ctx: {where}  cross_origin_blocked={block}\n"
                         "has_svg={svg}, has_canvas={canv}, has_legend={leg}\n"
@@ -705,6 +734,7 @@ def telegram_polling():
                             fechas=", ".join(fechas) if fechas else "-",
                             probe=used_date or "-",
                             btns=", ".join(landing_buttons) if landing_buttons else "-",
+                            nav=nav_info,
                             fb=("\n".join(frames_before) if frames_before else "(sin iframes)"),
                             where=map_ctx_where,
                             block=str(cross_block).lower(),
