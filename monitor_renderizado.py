@@ -198,6 +198,50 @@ def _get_map_frame(page):
         pass
     return page, "page"
 
+def _list_frames_info(page):
+    """Devuelve lista con info corta de frames: idx, url recortada."""
+    out = []
+    try:
+        for i, fr in enumerate(page.frames):
+            u = (fr.url or "").strip()
+            if len(u) > 140:
+                u = u[:140] + "…"
+            out.append(f"[{i}] {u}")
+    except Exception:
+        pass
+    return out
+
+NET_HITS_HINTS = ("seat", "seats", "zone", "zones", "map", "inventory", "section", "sections")
+
+def sniff_network_for_map(page, wait_ms=5000, max_show=2):
+    #"""Escucha respuestas que parezcan de mapa/sectores y devuelve resumenes."""
+    hits = []
+    def on_response(resp):
+        try:
+            url = (resp.url or "")
+            low = url.lower()
+            if not any(k in low for k in NET_HITS_HINTS):
+                return
+            ct = (resp.headers.get("content-type") or "").lower()
+            size = resp.headers.get("content-length") or "?"
+            hits.append((url, ct, size, resp.status))
+        except Exception:
+            return
+    page.on("response", on_response)
+    try:
+        page.wait_for_timeout(wait_ms)
+    finally:
+        try:
+            page.off("response", on_response)
+        except Exception:
+            pass
+    # Devolvemos los primeros max_show para no hacer ladrillo
+    out = []
+    for url, ct, size, status in hits[:max_show]:
+        short = url if len(url) <= 200 else (url[:200] + "…")
+        out.append(f"{status} {short}  [{ct or 'n/a'}]  {size} bytes")
+    return out
+
 def _choose_function_by_label(page, label: str):
     #"""Intenta clickear la fecha/función con cierto texto."""
     # abrir el dropdown si corresponde
@@ -470,34 +514,56 @@ def telegram_polling():
 
                         _open_dropdown_if_any(page)
                         region = _find_functions_region(page)
-                        pre = _gather_dates_in_region(region)
+                        fechas = _gather_dates_in_region(region)
 
-                        # === Nuevo: test de mapa ===
+                        # Intentar abrir algo de mapa por si aparece inline
                         _open_map_if_any(page)
+
+                        # Info de frames
+                        frames_info = _list_frames_info(page)
                         ctx, where = _get_map_frame(page)
 
-                        has_svg   = bool(ctx.query_selector("svg"))
-                        has_canvas= bool(ctx.query_selector("canvas"))
-                        has_legend= bool(ctx.query_selector("[class*='legend'], [data-testid*='legend']"))
+                        # Probar si podemos consultar dentro del ctx
+                        cross_block = False
+                        has_svg = has_canvas = has_legend = False
+                        try:
+                            has_svg    = bool(ctx.query_selector("svg"))
+                            has_canvas = bool(ctx.query_selector("canvas"))
+                            has_legend = bool(ctx.query_selector("[class*='legend'], [data-testid*='legend']"))
+                        except Exception:
+                            cross_block = True  # algo impide acceder al DOM del frame
 
-                        sectors_svg    = _get_colored_sectors_from_svg(ctx)
-                        sectors_legend = _get_sectors_from_legend(ctx)
+                        # Sniff de red (por si el mapa es canvas/app)
+                        net_hits = sniff_network_for_map(page, wait_ms=2500, max_show=2)
 
                         soldout = page_has_soldout(page)
-                        decision = "AVAILABLE_BY_DATES" if pre else ("SOLDOUT" if soldout else "UNKNOWN")
+                        decision = "AVAILABLE_BY_DATES" if fechas else ("SOLDOUT" if soldout else "UNKNOWN")
 
                         browser.close()
 
                     tg_send(
-                        f"🧪 DEBUG — {title}\n"
-                        f"URL idx {idx}\n"
-                        f"decision_hint={decision}\n"
-                        f"fechas: {', '.join(pre) if pre else '-'}\n"
-                        f"map_ctx: {where}\n"
-                        f"has_svg={has_svg}, has_canvas={has_canvas}, has_legend={has_legend}\n"
-                        f"svg_detected: {', '.join(sectors_svg) if sectors_svg else '-'}\n"
-                        f"legend_detected: {', '.join(sectors_legend) if sectors_legend else '-'}\n"
-                        f"{SIGN}",
+                        "🧪 DEBUG — {title}\n"
+                        "URL idx {idx}\n"
+                        "decision_hint={decision}\n"
+                        "fechas: {fechas}\n"
+                        "frames:\n{frames}\n"
+                        "map_ctx: {where}  cross_origin_blocked={block}\n"
+                        "has_svg={svg}, has_canvas={canv}, has_legend={leg}\n"
+                        "net_hits:\n{hits}\n"
+                        "{sign}".format(
+                            title=title,
+                            idx=idx,
+                            decision=decision,
+                            fechas=", ".join(fechas) if fechas else "-",
+                            frames=("\n".join(frames_info) if frames_info else "(sin iframes)"),
+                            where=where,
+                            block=str(cross_block).lower(),
+                            svg=str(has_svg).lower(),
+                            canv=str(has_canvas).lower(),
+                            leg=str(has_legend).lower(),
+                            hits=("\n".join("• "+h for h in net_hits) if net_hits else "(sin coincidencias)"),
+                            sign=SIGN
+                        ),
                         force=True
                     )
 
