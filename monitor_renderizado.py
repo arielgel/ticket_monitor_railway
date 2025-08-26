@@ -464,6 +464,133 @@ def _open_purchase_for_date(page, label: str):
     # 4) Nada cambió
     return page, False, "no-change"
 
+def _find_and_click_purchase_near_date(page, date_label: str):
+    """
+    Busca la tarjeta/contendor que contiene la fecha `date_label` y dentro de ese bloque
+    clickea 'Comprar' / 'Comprar entradas' / 'Continuar' / 'Ver entradas'.
+    Devuelve ('navigated'|'popup'|'clicked-no-nav'|'not-found', info_str).
+    """
+    try:
+        # 1) Ubicar el contenedor cercano a la fecha
+        #    Tomamos el primer nodo con el texto y subimos a un bloque grande (card)
+        node = page.get_by_text(date_label, exact=True)
+        if not node or node.count() == 0:
+            return "not-found", "date node not found"
+
+        # agarramos el primero visible
+        target = None
+        for i in range(min(node.count(), 5)):
+            it = node.nth(i)
+            if it.is_visible():
+                target = it
+                break
+        if not target:
+            return "not-found", "date node not visible"
+
+        # Subir a un contenedor “card”
+        container = None
+        for lvl in range(1, 10):
+            try:
+                anc = target.locator(f":scope >> xpath=ancestor::*[{lvl}]")
+                if anc and anc.count() > 0:
+                    c = anc.first
+                    # exigir que sea un bloque con botones/links adentro
+                    btns = c.locator("button, a")
+                    if btns.count() > 0:
+                        container = c
+                        break
+            except Exception:
+                continue
+        if not container:
+            container = target
+
+        container.scroll_into_view_if_needed(timeout=1500)
+        page.wait_for_timeout(200)
+
+        # 2) Buscar dentro del contenedor botones/links de compra
+        candidates = container.locator(
+            "button:has-text('Comprar'), a:has-text('Comprar'), "
+            "button:has-text('Comprar entradas'), a:has-text('Comprar entradas'), "
+            "button:has-text('Continuar'), a:has-text('Continuar'), "
+            "button:has-text('Ver entradas'), a:has-text('Ver entradas')"
+        )
+
+        if candidates.count() == 0:
+            # fallback: cualquier botón/link visible con palabras clave
+            candidates = container.locator("button, a")
+
+        # ordenar: priorizar “Comprar”, luego “Continuar”, luego “Ver entradas”
+        def weight(txt: str) -> int:
+            t = txt.lower()
+            if "comprar" in t: return 0
+            if "continuar" in t: return 1
+            if "entradas" in t: return 2
+            return 3
+
+        btns = []
+        n = min(candidates.count(), 20)
+        for i in range(n):
+            el = candidates.nth(i)
+            try:
+                if not el.is_visible(): continue
+                txt = (el.inner_text() or "").strip()
+                if not txt: continue
+                low = txt.lower()
+                if any(k in low for k in ["comprar", "entradas", "continuar", "ver entradas"]):
+                    btns.append((weight(txt), txt, el))
+            except Exception:
+                continue
+
+        if not btns:
+            return "not-found", "no purchase button in card"
+
+        btns.sort(key=lambda x: x[0])
+        before = page.url
+
+        # 3) Intentar navegación en la misma pestaña
+        for _, txt, el in btns[:5]:
+            try:
+                el.scroll_into_view_if_needed(timeout=1500)
+                with page.expect_navigation(wait_until="domcontentloaded", timeout=4000):
+                    el.click(timeout=2000, force=True)
+                after = page.url
+                page.wait_for_load_state("networkidle", timeout=4000)
+                if after != before:
+                    return "navigated", f"{txt}: {before} → {after}"
+            except Exception:
+                pass
+
+        # 4) Intentar popup
+        for _, txt, el in btns[:5]:
+            try:
+                el.scroll_into_view_if_needed(timeout=1500)
+                with page.expect_popup() as pinfo:
+                    el.click(timeout=2000, force=True)
+                popup = pinfo.value
+                try: popup.wait_for_load_state("domcontentloaded", timeout=5000)
+                except Exception: pass
+                return "popup", f"{txt}: {before} → {popup.url} (popup)"
+            except Exception:
+                pass
+
+        # 5) Click por JS si nada de lo anterior
+        for _, txt, el in btns[:5]:
+            try:
+                # forzar click via JS sobre ese elemento
+                page.evaluate("(e) => { e.scrollIntoView({block:'center'}); e.click(); }", el)
+                page.wait_for_timeout(500)
+                after = page.url
+                if after != before:
+                    return "navigated", f"{txt}: {before} → {after} (js)"
+                return "clicked-no-nav", f"{txt}: no navigation"
+            except Exception:
+                continue
+
+        return "not-found", "all attempts failed"
+    except Exception as e:
+        return "not-found", f"exception: {e}"
+	
+	
 def _click_candidates(ctx, selectors, pause_ms=500):
     """
     Intenta clickear cualquier selector visible de la lista, en orden.
@@ -821,7 +948,14 @@ def telegram_polling():
                         nav_info = "skip"
 
                         if used_date:
+                            # primero intentamos la apertura genérica
                             dest, opened_new, nav_info = _open_purchase_for_date(page, used_date)
+                            # si no hubo cambio, probamos directo en la card de la fecha
+                            if nav_info in ("no-change", "scrolled-buy", "scrolled-buy popup"):
+                                status, info = _find_and_click_purchase_near_date(page, used_date)
+                                nav_info = f"{nav_info} | card:{status} ({info})"
+                                dest = page  # seguimos en la misma page salvo que haya popup en el helper (lo reportaría)
+
                             # sniff extendido
                             net_hits = sniff_network_for_map(dest if not opened_new else dest, wait_ms=12000, max_show=8)
                             # buscar mapa
