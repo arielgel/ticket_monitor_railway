@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-# RadarEntradas — Detector sólido de AGOTADO / DISPONIBLE
-# Ari <3 — "Roberto" al servicio
+# RadarEntradas — Detector de AGOTADO / DISPONIBLE con logs por ciclo
+# "Roberto" reporting for duty 🫡
 
 import os, re, sys, time, traceback
-from datetime import datetime, time as dtime
+from datetime import datetime
 from zoneinfo import ZoneInfo
 from urllib.parse import urlparse
 
@@ -18,18 +18,18 @@ def _get_env_any(key: str, default: str = "") -> str:
         return default
     return str(v).strip()
 
-# Variables de entorno esperadas
 BOT_TOKEN   = _get_env_any("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID     = _get_env_any("TELEGRAM_CHAT_ID", "")
 URLS_RAW    = _get_env_any("URLS", _get_env_any("MONITORED_URLS", _get_env_any("URL", "")))
 CHECK_EVERY = int(_get_env_any("CHECK_EVERY_SECONDS", "300"))   # 5 min por defecto
 TZ_NAME     = _get_env_any("TIMEZONE", "America/Argentina/Buenos_Aires")
-LAST_LOOP_AT= None  # timestamp del último ciclo
-
 
 # No molestar (0–23, hora local)
-QUIET_START = int(_get_env_any("QUIET_START", "0"))  # ej 0
-QUIET_END   = int(_get_env_any("QUIET_END", "9"))    # ej 9
+QUIET_START = int(_get_env_any("QUIET_START", "1"))  # por defecto 1 (01:00)
+QUIET_END   = int(_get_env_any("QUIET_END", "9"))    # por defecto 9 (09:00)
+
+# Opcional: enviar resumen de disponibles en cada ciclo (por defecto OFF)
+NOTIFY_AVAILABLE_EVERY_LOOP = _get_env_any("NOTIFY_AVAILABLE_EVERY_LOOP", "0") == "1"
 
 SIGN = " — Roberto"
 
@@ -39,6 +39,9 @@ if not URLS_RAW:
     print("⚠️ Faltan URLs (URLS o MONITORED_URLS o URL).")
 
 URLS = [u.strip() for u in URLS_RAW.split(",") if u.strip()]
+
+# Timestamp del último ciclo (se muestra con /last)
+LAST_LOOP_AT = None
 
 # ========= Utilidades =========
 
@@ -54,26 +57,24 @@ def in_quiet_hours(dt: datetime) -> bool:
         return False
     if QUIET_START < QUIET_END:
         return QUIET_START <= h < QUIET_END
-    # rango cruzando medianoche
-    return h >= QUIET_START or h < QUIET_END
+    return h >= QUIET_START or h < QUIET_END  # rango cruza medianoche
 
 def tg_send(text: str, force: bool = False):
-    """Manda mensaje a Telegram (respeta modo no molestar salvo force=True)."""
+    """Manda mensaje a Telegram (respeta no molestar salvo force=True)."""
     if in_quiet_hours(now_local()) and not force:
-        print(f"[quiet] {text[:80]}...")
+        print(f"[quiet] {text[:90]}...", flush=True)
         return
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
         data = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
         requests.post(url, json=data, timeout=15)
     except Exception as e:
-        print(f"⚠️ Telegram error: {e}", file=sys.stderr)
+        print(f"⚠️ Telegram error: {e}", file=sys.stderr, flush=True)
 
 def prettify_from_slug(url: str) -> str:
     try:
         slug = url.rstrip("/").split("/")[-1]
-        slug = slug.replace("-", " ")
-        return slug.upper()
+        return slug.replace("-", " ").upper()
     except Exception:
         return url
 
@@ -85,7 +86,7 @@ def extract_title(page):
     except Exception:
         return None
 
-# ========= Perfiles de vendor (AllAccess + Deportick) =========
+# ========= Perfiles por dominio (AllAccess + Deportick) =========
 
 def _host(url: str) -> str:
     try:
@@ -108,8 +109,7 @@ VENDOR_PROFILES = {
             "button:has-text('Continuar')", "a:has-text('Continuar')",
         ],
     },
-
-    # Deportick: la página muestra “AGOTADO” en texto claro cuando no hay stock
+    # Deportick (texto AGOTADO al pie, simple y claro)
     "deportick.com": {
         "soldout_keywords": ["agotado", "agotadas"],
         "soldout_selectors": ["text=/agotad/i", ".agotado", ".agotadas"],
@@ -132,7 +132,6 @@ VENDOR_PROFILES = {
 
 # ========= Helpers de UI (fechas) =========
 
-# Abridores del dropdown (genéricos)
 FUNC_TRIGGERS = [
     "button[aria-haspopup='listbox']",
     "[role='combobox']",
@@ -153,7 +152,6 @@ def _open_dropdown_if_any(page):
             continue
 
 def _find_functions_region(page):
-    # intenta ubicar el bloque donde vive la lista de funciones/fechas
     for sel in ["select", "[role='listbox']", ".aa-event-dates", ".event-functions"]:
         try:
             r = page.locator(sel).first
@@ -161,11 +159,10 @@ def _find_functions_region(page):
                 return r
         except Exception:
             continue
-    # fallback: body
-    return page
+    return page  # fallback
 
 def _gather_dates_in_region(region):
-    """Devuelve lista de fechas (dd/mm/aaaa) si las encuentra; si no, []."""
+    """Devuelve lista de fechas DD/MM/AAAA si aparecen en el bloque; si no, []."""
     dates = set()
     try:
         txt = ""
@@ -173,13 +170,26 @@ def _gather_dates_in_region(region):
             txt = region.inner_text(timeout=500) or ""
         except Exception:
             txt = ""
-        # match fechas DD/MM/AAAA
         for m in re.findall(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b", txt):
             dd, mm, yy = m
-            dd = f"{int(dd):02d}"; mm = f"{int(mm):02d}"
-            dates.add(f"{dd}/{mm}/{yy}")
+            dates.add(f"{int(dd):02d}/{int(mm):02d}/{yy}")
     except Exception:
         pass
+    return sorted(dates)
+
+def _gather_dates_anywhere(page):
+    """
+    Fallback: busca fechas DD/MM/AAAA y DD/MM en todo el body.
+    """
+    dates = set()
+    try:
+        body_text = (page.evaluate("() => document.body.innerText") or "")
+    except Exception:
+        body_text = ""
+    for dd, mm, yy in re.findall(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b", body_text):
+        dates.add(f"{int(dd):02d}/{int(mm):02d}/{yy}")
+    for dd, mm in re.findall(r"\b(\d{1,2})/(\d{1,2})(?!/\d{2,4})\b", body_text):
+        dates.add(f"{int(dd):02d}/{int(mm):02d}")
     return sorted(dates)
 
 # ========= Detección de compra / agotado =========
@@ -221,13 +231,13 @@ def _detect_soldout(page, profile: dict) -> bool:
                 return True
         except Exception:
             continue
-    # 2) texto global del body
+    # 2) texto global
     try:
         body_text = (page.evaluate("() => document.body.innerText") or "").lower()
     except Exception:
         body_text = ""
     if _text_contains_any(body_text, profile.get("soldout_keywords", [])):
-        # Evitar falsos positivos evidentes (formularios de perfil)
+        # Evitar falsos positivos muy obvios
         noise = ["+54", "número de dni", "masculino", "femenino", "argentina", "brasil"]
         if not _text_contains_any(body_text, noise):
             return True
@@ -238,7 +248,7 @@ def _detect_soldout(page, profile: dict) -> bool:
 def check_url(url: str, page):
     """
     Devuelve (fechas, title, hint):
-      - fechas: lista 'dd/mm/aaaa' si se detectó disponibilidad por fechas
+      - fechas: lista 'dd/mm/aaaa' (o dd/mm) si se detectó por UI
       - title: título del show
       - hint: 'AVAILABLE_BY_DATES' | 'AVAILABLE_BY_BUY' | 'SOLDOUT' | 'UNKNOWN'
     """
@@ -247,20 +257,32 @@ def check_url(url: str, page):
     page.goto(url, timeout=60000)
     page.wait_for_load_state("networkidle", timeout=15000)
 
-    title = extract_title(page) or prettify_from_slug(url)
+    # micro-scroll para destrabar contenido lazy
+    try:
+        page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(200)
+        page.evaluate("() => window.scrollTo(0, 0)")
+        page.wait_for_timeout(100)
+    except Exception:
+        pass
 
+    title = extract_title(page) or prettify_from_slug(url)
     prof = VENDOR_PROFILES.get(_host(url)) or VENDOR_PROFILES.get("www.allaccess.com.ar")
 
-    # 1) fechas visibles (si hay, priorizamos que está disponible)
+    # 1) fechas (preferimos la región de funciones)
     _open_dropdown_if_any(page)
     region = _find_functions_region(page)
     fechas = _gather_dates_in_region(region)
+    if not fechas:
+        alt = _gather_dates_anywhere(page)
+        if alt:
+            fechas = alt
 
     # 2) flags de compra / agotado
     buy = _detect_buy(page, prof)
     sold = _detect_soldout(page, prof)
 
-    # 3) decisión (determinística)
+    # 3) decisión
     if fechas:
         hint = "AVAILABLE_BY_DATES"
     elif buy and not sold:
@@ -272,7 +294,7 @@ def check_url(url: str, page):
 
     return fechas, title, hint
 
-# ========= Telegram: listado y status =========
+# ========= Telegram =========
 
 def list_shows() -> list[str]:
     out = []
@@ -298,17 +320,13 @@ def status_for(idx: int | None = None) -> list[str]:
 
         items = enumerate(URLS, 1)
         if isinstance(idx, int):
-            items = [(idx, URLS[idx-1])]  # single
+            items = [(idx, URLS[idx-1])]
 
         for i, url in items:
             try:
                 fechas, title, hint = check_url(url, page)
-
                 if hint in ("AVAILABLE_BY_DATES", "AVAILABLE_BY_BUY"):
-                    if fechas:
-                        fechas_txt = ", ".join(sorted(fechas))
-                    else:
-                        fechas_txt = "(sin fecha)"
+                    fechas_txt = ", ".join(sorted(fechas)) if fechas else "(sin fecha)"
                     msg = f"✅ **Disponible** — {title}\nFechas: {fechas_txt}\nÚltimo check: {now_local():%Y-%m-%d %H:%M:%S}{SIGN}"
                 elif hint == "SOLDOUT":
                     msg = f"⛔ Agotado — {title}\nÚltimo check: {now_local():%Y-%m-%d %H:%M:%S}{SIGN}"
@@ -321,9 +339,8 @@ def status_for(idx: int | None = None) -> list[str]:
         browser.close()
     return results
 
-# ========= Telegram: polling =========
-
 def telegram_polling():
+    global LAST_LOOP_AT
     last_update_id = None
     base = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
@@ -338,10 +355,7 @@ def telegram_polling():
 
     while True:
         data = get_updates(last_update_id + 1 if last_update_id else None)
-        try:
-            ok = data.get("ok", False)
-        except Exception:
-            ok = False
+        ok = data.get("ok", False) if isinstance(data, dict) else False
         if not ok:
             time.sleep(1)
             continue
@@ -356,7 +370,6 @@ def telegram_polling():
                 continue
             tlow = text.lower()
 
-            # /shows
             if tlow.startswith("/shows"):
                 names = list_shows()
                 if names:
@@ -364,7 +377,6 @@ def telegram_polling():
                 else:
                     tg_send("No hay URLs configuradas." + SIGN, force=True)
 
-            # /status [N]
             elif tlow.startswith("/status"):
                 m = re.match(r"^/status\s+(\d+)\s*$", tlow)
                 if m:
@@ -378,7 +390,6 @@ def telegram_polling():
                     for s in status_for(None):
                         tg_send(s, force=True)
 
-            # /debug [N] — diagnóstico simple del hint
             elif tlow.startswith("/debug"):
                 m = re.match(r"^/debug\s+(\d+)\s*$", tlow)
                 if not m:
@@ -400,8 +411,8 @@ def telegram_polling():
                             "decision_hint={hint}\n"
                             "fechas: {fechas}\n"
                             "{sign}".format(
-                                title=title, idx=idx,
-                                hint=hint, fechas=", ".join(fechas) if fechas else "-",
+                                title=title, idx=idx, hint=hint,
+                                fechas=", ".join(fechas) if fechas else "-",
                                 sign=SIGN
                             ),
                             force=True
@@ -411,14 +422,6 @@ def telegram_polling():
                     finally:
                         browser.close()
 
-            # /sectores [N] — placeholder (no rompe nada)
-            elif tlow.startswith("/last") or tlow.startswith("/ping"):
-                ts = LAST_LOOP_AT
-                if ts is None:
-                    tg_send(f"Aún no hay un ciclo registrado. Esperá el primer loop…{SIGN}", force=True)
-                else:
-                    tg_send(f"⏱️ Último ciclo: {ts:%Y-%m-%d %H:%M:%S} ({TZ_NAME}){SIGN}", force=True)
-
             elif tlow.startswith("/sectores"):
                 m = re.match(r"^/sectores\s+(\d+)\s*$", tlow)
                 if not m:
@@ -426,11 +429,15 @@ def telegram_polling():
                     continue
                 idx = int(m.group(1))
                 names = list_shows()
-                if 1 <= idx <= len(URLS):
-                    name = names[idx-1].split(". ", 1)[-1]
-                else:
-                    name = f"#{idx}"
+                name = names[idx-1].split(". ", 1)[-1] if 1 <= idx <= len(URLS) else f"#{idx}"
                 tg_send(f"🧭 {name} — Sectores disponibles:\n(sin sectores)\n{SIGN}", force=True)
+
+            elif tlow.startswith("/last") or tlow.startswith("/ping"):
+                ts = LAST_LOOP_AT
+                if ts is None:
+                    tg_send(f"Aún no hay un ciclo registrado. Esperá el primer loop…{SIGN}", force=True)
+                else:
+                    tg_send(f"⏱️ Último ciclo: {ts:%Y-%m-%d %H:%M:%S} ({TZ_NAME}){SIGN}", force=True)
 
         time.sleep(0.4)
 
@@ -438,7 +445,7 @@ def telegram_polling():
 
 def monitor_loop():
     global LAST_LOOP_AT
-    last_snapshot = {}
+    last_snapshot = {}  # url -> 'SOLDOUT'|'AVAILABLE'|'UNKNOWN'
     while True:
         try:
             print(f"[loop] start {now_local():%Y-%m-%d %H:%M:%S} urls={len(URLS)}", flush=True)
@@ -446,48 +453,60 @@ def monitor_loop():
                 browser = p.chromium.launch(headless=True)
                 page = browser.new_page()
 
+                available_summary = []
 
                 for url in URLS:
                     try:
                         fechas, title, hint = check_url(url, page)
-
-                        # Reducimos a un estado simple para comparar
                         state = "SOLDOUT" if hint == "SOLDOUT" else ("AVAILABLE" if hint.startswith("AVAILABLE") else "UNKNOWN")
                         prev = last_snapshot.get(url)
 
+                        # Log por URL (para ver que pasó por acá)
+                        fechas_txt = ", ".join(fechas) if fechas else "(sin fecha)"
+                        print(f"[loop-check] {title} → {state} ({fechas_txt})", flush=True)
+
                         # Notificación de transición a DISPONIBLE
                         if prev in (None, "SOLDOUT", "UNKNOWN") and state == "AVAILABLE":
-                            fechas_txt = ", ".join(fechas) if fechas else "(sin fecha)"
                             tg_send(f"✅ ¡Entradas disponibles!\n{title}\nFechas: {fechas_txt}\n{SIGN}", force=True)
 
-                        # Notificación de transición a AGOTADO (no spam; solo informativa si venía en available)
+                        # Notificación de transición a AGOTADO (suave)
                         if prev == "AVAILABLE" and state == "SOLDOUT":
                             tg_send(f"⛔ Se agotó — {title}{SIGN}", force=False)
+
+                        if state == "AVAILABLE":
+                            available_summary.append(f"- {title} — {fechas_txt}")
 
                         last_snapshot[url] = state
 
                     except Exception as e:
-                        print(f"⚠️ Error check {url}: {e}")
+                        print(f"⚠️ Error check {url}: {e}", flush=True)
                         traceback.print_exc()
+
+                # Resumen opcional por ciclo
+                if NOTIFY_AVAILABLE_EVERY_LOOP and available_summary:
+                    tg_send(
+                        "✅ Disponibles ahora (" + str(len(available_summary)) + "):\n"
+                        + "\n".join(available_summary)
+                        + f"\nÚltimo check: {now_local():%Y-%m-%d %H:%M:%S}{SIGN}",
+                        force=True
+                    )
 
                 browser.close()
 
         except Exception as e:
-            print(f"💥 Loop error: {e}")
+            print(f"💥 Loop error: {e}", flush=True)
         finally:
             LAST_LOOP_AT = now_local()
             print(f"[loop] done  {LAST_LOOP_AT:%Y-%m-%d %H:%M:%S} — sleeping {CHECK_EVERY}s", flush=True)
             time.sleep(max(30, CHECK_EVERY))
 
-
 # ========= Arranque =========
 
 if __name__ == "__main__":
     mode = _get_env_any("MODE", "both").lower()   # both | bot | monitor
-    print(f"[RadarEntradas] mode={mode} urls={len(URLS)} tz={TZ_NAME} quiet={QUIET_START}-{QUIET_END}")
+    print(f"[RadarEntradas] mode={mode} urls={len(URLS)} tz={TZ_NAME} quiet={QUIET_START}-{QUIET_END}", flush=True)
 
     if mode in ("bot", "both"):
-        # Bot en un hilo simple (proceso único en Railway)
         import threading
         th = threading.Thread(target=telegram_polling, daemon=True)
         th.start()
