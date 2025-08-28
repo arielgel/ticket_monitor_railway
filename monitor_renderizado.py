@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 # RadarEntradas — Detector de AGOTADO / DISPONIBLE con logs por ciclo
-# "Roberto" reporting for duty 🫡
 
 import os, re, sys, time, traceback
 from datetime import datetime
@@ -25,8 +24,8 @@ CHECK_EVERY = int(_get_env_any("CHECK_EVERY_SECONDS", "300"))   # 5 min por defe
 TZ_NAME     = _get_env_any("TIMEZONE", "America/Argentina/Buenos_Aires")
 
 # No molestar (0–23, hora local)
-QUIET_START = int(_get_env_any("QUIET_START", "1"))  # por defecto 1 (01:00)
-QUIET_END   = int(_get_env_any("QUIET_END", "9"))    # por defecto 9 (09:00)
+QUIET_START = int(_get_env_any("QUIET_START", "1"))
+QUIET_END   = int(_get_env_any("QUIET_END", "9"))
 
 # Opcional: enviar resumen de disponibles en cada ciclo (por defecto OFF)
 NOTIFY_AVAILABLE_EVERY_LOOP = _get_env_any("NOTIFY_AVAILABLE_EVERY_LOOP", "0") == "1"
@@ -57,7 +56,7 @@ def in_quiet_hours(dt: datetime) -> bool:
         return False
     if QUIET_START < QUIET_END:
         return QUIET_START <= h < QUIET_END
-    return h >= QUIET_START or h < QUIET_END  # rango cruza medianoche
+    return h >= QUIET_START or h < QUIET_END
 
 def tg_send(text: str, force: bool = False):
     """Manda mensaje a Telegram (respeta no molestar salvo force=True)."""
@@ -108,8 +107,9 @@ VENDOR_PROFILES = {
             "button:has-text('Ver entradas')", "a:has-text('Ver entradas')",
             "button:has-text('Continuar')", "a:has-text('Continuar')",
         ],
+        "disable_global_date_fallback": False,
     },
-    # Deportick (texto AGOTADO al pie, simple y claro)
+    # Deportick (texto AGOTADO al pie, evitar fallback global de fechas)
     "deportick.com": {
         "soldout_keywords": ["agotado", "agotadas"],
         "soldout_selectors": ["text=/agotad/i", ".agotado", ".agotadas"],
@@ -118,6 +118,7 @@ VENDOR_PROFILES = {
             "button:has-text('Comprar')", "a:has-text('Comprar')",
             "button:has-text('Comprar entradas')", "a:has-text('Comprar entradas')",
         ],
+        "disable_global_date_fallback": True,
     },
     "www.deportick.com": {
         "soldout_keywords": ["agotado", "agotadas"],
@@ -127,6 +128,7 @@ VENDOR_PROFILES = {
             "button:has-text('Comprar')", "a:has-text('Comprar')",
             "button:has-text('Comprar entradas')", "a:has-text('Comprar entradas')",
         ],
+        "disable_global_date_fallback": True,
     },
 }
 
@@ -177,20 +179,41 @@ def _gather_dates_in_region(region):
         pass
     return sorted(dates)
 
-def _gather_dates_anywhere(page):
+# --- Filtro de fechas globales (evita “retiro/canje/pick up”) ---
+
+_RETIRO_KEYS = ("retiro", "retirá", "retirar", "retíralo", "canje", "pick up", "punto de retiro", "retirás")
+
+def _dates_from_text_filtered(body_text: str):
     """
-    Fallback: busca fechas DD/MM/AAAA y DD/MM en todo el body.
+    Extrae fechas evitando falsos positivos de secciones de retiro/canje.
+    Se filtra por ventana de contexto +/- 80 caracteres alrededor del match.
     """
     dates = set()
+    text = body_text or ""
+    for m in re.finditer(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b", text):
+        dd = int(m.group(1)); mm = int(m.group(2))
+        yy = m.group(3)
+        # Ventana de contexto
+        i0 = max(0, m.start() - 80)
+        i1 = min(len(text), m.end() + 80)
+        ctx = text[i0:i1].lower()
+        if any(k in ctx for k in _RETIRO_KEYS):
+            continue
+        if yy:
+            dates.add(f"{dd:02d}/{mm:02d}/{yy if len(yy)==4 else ('20'+yy)}")
+        else:
+            dates.add(f"{dd:02d}/{mm:02d}")
+    return sorted(dates)
+
+def _gather_dates_anywhere(page):
+    """
+    Fallback: busca fechas DD/MM(/AAAA) en todo el body, con filtro anti-retiro.
+    """
     try:
         body_text = (page.evaluate("() => document.body.innerText") or "")
     except Exception:
         body_text = ""
-    for dd, mm, yy in re.findall(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b", body_text):
-        dates.add(f"{int(dd):02d}/{int(mm):02d}/{yy}")
-    for dd, mm in re.findall(r"\b(\d{1,2})/(\d{1,2})(?!/\d{2,4})\b", body_text):
-        dates.add(f"{int(dd):02d}/{int(mm):02d}")
-    return sorted(dates)
+    return _dates_from_text_filtered(body_text)
 
 # ========= Detección de compra / agotado =========
 
@@ -248,7 +271,7 @@ def _detect_soldout(page, profile: dict) -> bool:
 def check_url(url: str, page):
     """
     Devuelve (fechas, title, hint):
-      - fechas: lista 'dd/mm/aaaa' (o dd/mm) si se detectó por UI
+      - fechas: lista 'dd/mm/aaaa' (o dd/mm) si se detectó por UI válida
       - title: título del show
       - hint: 'AVAILABLE_BY_DATES' | 'AVAILABLE_BY_BUY' | 'SOLDOUT' | 'UNKNOWN'
     """
@@ -273,7 +296,9 @@ def check_url(url: str, page):
     _open_dropdown_if_any(page)
     region = _find_functions_region(page)
     fechas = _gather_dates_in_region(region)
-    if not fechas:
+
+    # ⚠️ Para algunos vendors (Deportick) deshabilitamos el fallback global
+    if not fechas and not prof.get("disable_global_date_fallback", False):
         alt = _gather_dates_anywhere(page)
         if alt:
             fechas = alt
@@ -282,13 +307,14 @@ def check_url(url: str, page):
     buy = _detect_buy(page, prof)
     sold = _detect_soldout(page, prof)
 
-    # 3) decisión
-    if fechas:
-        hint = "AVAILABLE_BY_DATES"
-    elif buy and not sold:
-        hint = "AVAILABLE_BY_BUY"
-    elif sold and not buy:
+    # 3) decisión — prioridad a SOLDOUT si no hay botón de compra
+    #    (evita falsos "disponible" por fechas de retiro/canje)
+    if sold and not buy:
         hint = "SOLDOUT"
+    elif fechas:
+        hint = "AVAILABLE_BY_DATES"
+    elif buy:
+        hint = "AVAILABLE_BY_BUY"
     else:
         hint = "UNKNOWN"
 
