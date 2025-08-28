@@ -24,6 +24,8 @@ CHAT_ID     = _get_env_any("TELEGRAM_CHAT_ID", "")
 URLS_RAW    = _get_env_any("URLS", _get_env_any("MONITORED_URLS", _get_env_any("URL", "")))
 CHECK_EVERY = int(_get_env_any("CHECK_EVERY_SECONDS", "300"))   # 5 min por defecto
 TZ_NAME     = _get_env_any("TIMEZONE", "America/Argentina/Buenos_Aires")
+LAST_LOOP_AT= None  # timestamp del último ciclo
+
 
 # No molestar (0–23, hora local)
 QUIET_START = int(_get_env_any("QUIET_START", "0"))  # ej 0
@@ -410,6 +412,13 @@ def telegram_polling():
                         browser.close()
 
             # /sectores [N] — placeholder (no rompe nada)
+            elif tlow.startswith("/last") or tlow.startswith("/ping"):
+                ts = LAST_LOOP_AT
+                if ts is None:
+                    tg_send(f"Aún no hay un ciclo registrado. Esperá el primer loop…{SIGN}", force=True)
+                else:
+                    tg_send(f"⏱️ Último ciclo: {ts:%Y-%m-%d %H:%M:%S} ({TZ_NAME}){SIGN}", force=True)
+
             elif tlow.startswith("/sectores"):
                 m = re.match(r"^/sectores\s+(\d+)\s*$", tlow)
                 if not m:
@@ -428,12 +437,15 @@ def telegram_polling():
 # ========= Loop de monitoreo =========
 
 def monitor_loop():
-    last_snapshot = {}  # url -> hint_state ('SOLDOUT'|'AVAILABLE'|'UNKNOWN')
+    global LAST_LOOP_AT
+    last_snapshot = {}
     while True:
         try:
+            print(f"[loop] start {now_local():%Y-%m-%d %H:%M:%S} urls={len(URLS)}", flush=True)
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=True)
                 page = browser.new_page()
+
 
                 for url in URLS:
                     try:
@@ -463,7 +475,10 @@ def monitor_loop():
         except Exception as e:
             print(f"💥 Loop error: {e}")
         finally:
+            LAST_LOOP_AT = now_local()
+            print(f"[loop] done  {LAST_LOOP_AT:%Y-%m-%d %H:%M:%S} — sleeping {CHECK_EVERY}s", flush=True)
             time.sleep(max(30, CHECK_EVERY))
+
 
 # ========= Arranque =========
 
